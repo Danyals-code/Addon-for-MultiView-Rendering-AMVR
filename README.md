@@ -28,7 +28,7 @@ view in one click, with predictable file names like `AA_01_Widget_Front_clay.png
 ### Option B: clone the repo
 
 ```bash
-git clone https://github.com/Danyals-code/MultiView-Product-Render-Blender-Addon.git
+git clone https://github.com/Danyals-code/Addon-for-MultiView-Rendering-AMVR.git
 ```
 
 Copy the `multiview_product_renderer` folder into your Blender add-ons directory:
@@ -82,7 +82,10 @@ The sidebar is laid out in the order you should use it.
 ### 1. Scene Setup
 
 Pick a lighting preset and a background, then **Apply Scene Setup**. This builds an
-`MV_Lighting` collection and sets the world background.
+`MV_Lighting` collection and switches the scene to the add-on's own `MV_World`.
+
+Your existing world is left intact — it is only deselected, not edited, so an HDRI setup
+you built yourself survives and can be picked again from World properties.
 
 | Lighting preset | Look |
 | --- | --- |
@@ -187,26 +190,31 @@ overwrites your render settings, and the clay pass restores your engine when it 
 
 #### File naming
 
-Output is organised per product and named deterministically:
+Output is organised per product and named deterministically. The suffix comes from
+the render mode: **Clay** writes `_clay`, **Full Render** writes no suffix, and **Both**
+writes `_render` and `_clay` side by side. Clay is the default, so a first run looks
+like this:
 
 ```
 renders/
   AA_01_Widget/
-    AA_01_Widget_Front.png
-    AA_01_Widget_Top.png
-    AA_01_Widget_Persp_FTR.png
+    AA_01_Widget_Front_clay.png
+    AA_01_Widget_Top_clay.png
+    AA_01_Widget_Persp_FTR_clay.png
   AA_02_Bracket/
-    AA_02_Bracket_Front.png
+    AA_02_Bracket_Front_clay.png
     ...
 ```
 
 The `AA_01` label is controlled by three fields:
 
-- **Start Prefix**: the letter pair for the first product (`AA`, `BB`, ...).
+- **Start Prefix**: the letter pair for the first product (`AA`, `BB`, ...). Only the
+  first character is read, since the label just repeats it — typing `AB` gives `AA`.
 - **Start Number**: the number the batch starts at, so a second batch can continue from
   `AA_11` instead of restarting at `AA_01`.
 - **Products per Letter**: how many products before the prefix rolls over to the next
-  letter pair.
+  letter pair. After `ZZ` the label grows a character rather than wrapping, so it runs
+  `AAA`, `BBB`, ... and every product keeps a folder of its own.
 
 ---
 
@@ -218,8 +226,11 @@ The `AA_01` label is controlled by three fields:
 | `MV_Cameras` | Generated cameras, named `MV_Cam_<View>`. |
 | `MV_Lighting` | The lights from the active lighting preset. |
 
-Rebuilding cameras or lighting clears and regenerates only that collection. Your products
-are never touched.
+It also creates one world datablock, `MV_World`, for the background.
+
+Rebuilding cameras or lighting clears and regenerates only that collection, discarding the
+camera and light datablocks it made last time rather than leaving them behind. Your
+products, and any other world in the file, are never touched.
 
 ---
 
