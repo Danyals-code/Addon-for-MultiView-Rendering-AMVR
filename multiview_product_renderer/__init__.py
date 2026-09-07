@@ -523,13 +523,16 @@ def find_layer_coll(layer_coll, name):
 
 
 def alpha_pair(idx):
+    """Repeated-letter group label: AA..ZZ, then AAA..ZZZ, then AAAA..
+
+    The letter cycles every 26 groups and the label grows a character on each
+    wrap, so no two indices share a label. The width has to key off the wrap
+    count -- an earlier version restarted at two letters after ZZ, which handed
+    index 26 the same 'AA' as index 0 and pointed two products at one output
+    folder, where the second silently overwrote the first.
+    """
     idx = max(0, idx)
-    if idx <= 25:
-        c = chr(ord('A') + idx)
-        return c + c
-    n = 2 + (idx - 26) // 26
-    c = chr(ord('A') + ((idx - 26) % 26))
-    return c * n
+    return chr(ord('A') + idx % 26) * (2 + idx // 26)
 
 
 def alpha_pair_to_idx(prefix):
@@ -590,11 +593,13 @@ def freecad_prepare(step_path, freecad_exe, deflection):
         return None
     tmp_dir = tempfile.mkdtemp(prefix="mv_step_")
     obj_out = os.path.join(tmp_dir, os.path.splitext(os.path.basename(step_path))[0] + ".obj")
-    quoted_step = step_path.replace("\\", "\\\\").replace("'", "\'")
-    quoted_obj = obj_out.replace("\\", "\\\\").replace("'", "\'")
+    # Paths go in as %r, not hand-escaped into '...'. A path holding an
+    # apostrophe -- C:\Users\Dan's Files\part.step -- closed the string early
+    # and the script died of a SyntaxError that surfaced as a bare "conversion
+    # failed". repr() handles quotes, backslashes and newlines in one step.
     script = (
         "import Import, MeshPart, FreeCAD\n"
-        "Import.open('%s')\n" % quoted_step +
+        "Import.open(%r)\n" % step_path +
         "doc = FreeCAD.ActiveDocument\n"
         "meshes = []\n"
         "for obj in doc.Objects:\n"
@@ -608,7 +613,7 @@ def freecad_prepare(step_path, freecad_exe, deflection):
         "    m = meshes[0]\n"
         "    for extra in meshes[1:]:\n"
         "        m.addMesh(extra)\n"
-        "    m.write('%s')\n" % quoted_obj
+        "    m.write(%r)\n" % obj_out
     )
     script_path = os.path.join(tmp_dir, "convert.py")
     with open(script_path, "w", encoding="utf-8") as f:
