@@ -181,10 +181,19 @@ vector and an ortho/perspective toggle, and it gets built alongside the rest.
 modelled the same way. In practice a few arrive facing the wrong way, and this is where you
 turn them by hand.
 
-**Previous** and **Next** step through the batch one product at a time, showing the current
-one and excluding the rest. That is the same isolation **Render All** uses, so what you see
-is what that product's render will contain. The list wraps, so you can keep pressing
-**Next** all the way round. **Show All** brings everything back when you are done.
+**Isolate Active Product** (on by default) means you only ever see the one you are working
+on. Rotating or stepping hides the others, so a product is never obscured by the rest of the
+batch while you are trying to orient it. The checkbox applies the moment you tick it, and
+unticking it brings everything back.
+
+That is the same isolation **Render All** uses, so what you see is what that product's
+render will contain. It is viewport state only — a batch render saves it, isolates each
+product in turn, and puts it back afterwards, so leaving it switched on never changes what
+gets rendered.
+
+**Previous** and **Next** step through the batch one product at a time. The list wraps, so
+you can keep pressing **Next** all the way round. **Show All** reveals every product and
+switches the checkbox off, so the next rotation does not immediately hide them again.
 
 **Left**, **Right**, **Up** and **Down** turn the product that is currently showing:
 
@@ -284,8 +293,9 @@ Standardize panel with **Rescale** enabled.
 the cameras. If only some products are wrong, Front Axis will not help — it moves the whole
 batch. Use *Orient Products* to turn the offenders individually, then rebuild.
 
-**Only one product is visible in the viewport**: you left a *Previous* / *Next* review pass
-part way through, which excludes the others. Click **Show All** in Cameras / Views.
+**Only one product is visible in the viewport**: **Isolate Active Product** is on, which is
+the default while orienting. Click **Show All** in Cameras / Views, or untick the box.
+Renders are unaffected either way.
 
 **Renders are cropped after rotating products**: rotating changes the bounding box the
 framing was measured from. Click *Build Cameras* again.

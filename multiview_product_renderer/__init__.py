@@ -148,6 +148,18 @@ class MV_CustomView(PropertyGroup):
     is_ortho: BoolProperty(name="Ortho", default=False)
 
 
+def _update_isolate(self, context):
+    """Apply the isolate toggle the moment it is ticked, rather than waiting
+    for the next rotate or step.
+
+    Defined up here because the property below references it while the class
+    body runs; the helpers it calls are resolved at call time, so they can live
+    further down the file with the rest of the product code.
+    """
+    coll, _ = active_product(context)
+    isolate_product(context, coll.name if (self.isolate_active and coll) else None)
+
+
 class MV_Settings(PropertyGroup):
     step_files: CollectionProperty(type=MV_StepFileItem)
     step_files_index: IntProperty(default=0)
@@ -275,6 +287,13 @@ class MV_Settings(PropertyGroup):
         name="Active Product",
         description="Which product the orientation buttons act on",
         default=0, min=0,
+    )
+    isolate_active: BoolProperty(
+        name="Isolate Active Product",
+        description="Show only the product being oriented and hide the rest. "
+                    "Batch renders are unaffected either way",
+        default=True,
+        update=_update_isolate,
     )
     rotate_step: FloatProperty(
         name="Rotate Step",
@@ -1430,7 +1449,14 @@ class MV_OT_RotateProduct(Operator):
         if coll is None:
             self.report({'ERROR'}, f"No product collections under '{PRODUCT_COLL}'.")
             return {'CANCELLED'}
-        step = context.scene.mv_settings.rotate_step
+        s = context.scene.mv_settings
+        # Isolate first, not after. Rotating reads matrices off the product, so
+        # it has to be in the view layer before the maths runs -- and it means
+        # you are looking at the thing you are turning while you turn it.
+        if s.isolate_active:
+            isolate_product(context, coll.name)
+            context.view_layer.update()
+        step = s.rotate_step
         if not rotate_product(context, coll, self.direction, step):
             self.report({'WARNING'}, f"'{coll.name}' has no geometry to rotate.")
             return {'CANCELLED'}
@@ -1458,13 +1484,14 @@ class MV_OT_ProductStep(Operator):
         # Wraps, so a review pass round a batch never dead-ends on the last one.
         idx = (idx + self.delta) % len(products)
         s.active_product_index = idx
-        isolate_product(context, products[idx].name)
+        if s.isolate_active:
+            isolate_product(context, products[idx].name)
         self.report({'INFO'}, f"{products[idx].name}  ({idx + 1}/{len(products)})")
         return {'FINISHED'}
 
 
 class MV_OT_ShowAllProducts(Operator):
-    """Bring every product back into the view layer"""
+    """Turn isolation off and bring every product back into the view layer"""
     bl_idname = "mv.show_all_products"
     bl_label = "Show All"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1474,6 +1501,9 @@ class MV_OT_ShowAllProducts(Operator):
         if not products:
             self.report({'ERROR'}, f"No product collections under '{PRODUCT_COLL}'.")
             return {'CANCELLED'}
+        # Clears the toggle as well as the state. Only unhiding would leave the
+        # next rotate to isolate again, which reads as the button not working.
+        context.scene.mv_settings.isolate_active = False
         isolate_product(context, None)
         self.report({'INFO'}, f"Showing all {len(products)} product(s).")
         return {'FINISHED'}
@@ -1777,6 +1807,7 @@ class MV_PT_Cameras(Panel):
         coll, idx = active_product(context)
         box.label(text=f"{coll.name}  ({idx + 1}/{len(products)})",
                   icon='OUTLINER_COLLECTION')
+        box.prop(s, "isolate_active")
         box.prop(s, "rotate_step")
 
         col = box.column(align=True)
