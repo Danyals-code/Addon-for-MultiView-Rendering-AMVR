@@ -1,6 +1,6 @@
 bl_info = {
     "name": "MultiView Product Renderer",
-    "author": "MultiView",
+    "author": "Danyal Sarfraz",
     "version": (1, 3, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > MultiView",
@@ -84,6 +84,7 @@ LIGHTING_PRESETS = {
 CAMERA_COLL = "MV_Cameras"
 LIGHT_COLL = "MV_Lighting"
 PRODUCT_COLL = "MV_Products"
+WORLD_NAME = "MV_World"
 
 GUIDE_LINES = [
     "1. Scene Setup: pick a lighting preset and background, then Apply.",
@@ -207,7 +208,9 @@ class MV_Settings(PropertyGroup):
 
     start_prefix: StringProperty(
         name="Start Prefix",
-        description="Two-letter prefix for the first product (AA, BB, ...)",
+        description="Letter the first product group is labelled with. The "
+                    "label repeats it (AA, BB, ...), so only the first "
+                    "character is read -- typing AB gives AA",
         default="AA", maxlen=3,
     )
     start_number: IntProperty(
@@ -321,10 +324,25 @@ def look_at(location, target, up=Vector((0, 0, 1))):
 
 
 def clear_collection_objects(coll):
+    """Remove a collection's objects along with the data they leave behind.
+
+    objects.remove() drops the object but not its camera or light datablock, so
+    every rebuild of the rig orphaned another set and the next one came back as
+    MV_Cam_Front.001, .002, ... The file kept growing until a save and reload
+    purged them. Data another object still uses, or that is pinned with a fake
+    user, is left alone.
+    """
     if coll is None:
         return
     for obj in list(coll.objects):
+        data = obj.data
         bpy.data.objects.remove(obj, do_unlink=True)
+        if data is None or data.users or data.use_fake_user:
+            continue
+        if isinstance(data, bpy.types.Camera):
+            bpy.data.cameras.remove(data)
+        elif isinstance(data, bpy.types.Light):
+            bpy.data.lights.remove(data)
 
 
 def collection_meshes(coll):
@@ -902,9 +920,17 @@ def build_lighting(context, preset_key):
 
 
 def apply_world(context):
+    """Point the scene at the add-on's own world and rewrite that one.
+
+    This used to reuse whatever world the scene already had and clear its node
+    tree, so pressing Apply Background on a file with a hand-built HDRI setup
+    destroyed it with no warning and no undo. The add-on now owns a single
+    MV_World, the same way it owns MV_Cameras and MV_Lighting. Any other world
+    keeps its nodes and stays selectable from World properties.
+    """
     settings = context.scene.mv_settings
     scene = context.scene
-    world = scene.world or bpy.data.worlds.new("MV_World")
+    world = bpy.data.worlds.get(WORLD_NAME) or bpy.data.worlds.new(WORLD_NAME)
     scene.world = world
     world.use_nodes = True
     nodes = world.node_tree.nodes
@@ -998,11 +1024,16 @@ class MV_OT_ImportAllSteps(Operator):
         self._done += 1
 
     def _link_new(self, context, path, new_objs):
+        # Always a fresh collection. Looking the name up first meant two STEP
+        # files sharing a basename -- partA/housing.step and partB/housing.step
+        # -- landed in one collection and rendered as a single product, and an
+        # unrelated collection that happened to be called "housing" would have
+        # the geometry dropped into it. Blender resolves the clash itself by
+        # suffixing .001, which keeps the two products separate.
         root = get_products_root()
         base = os.path.splitext(os.path.basename(path))[0]
-        product_coll = bpy.data.collections.get(base) or bpy.data.collections.new(base)
-        if product_coll.name not in root.children:
-            root.children.link(product_coll)
+        product_coll = bpy.data.collections.new(base)
+        root.children.link(product_coll)
         for obj in new_objs:
             for c in list(obj.users_collection):
                 c.objects.unlink(obj)
@@ -1071,7 +1102,19 @@ class MV_OT_ImportAllSteps(Operator):
         """One slice of work. False once everything is finished."""
         if self._job is not None:
             if blocking:
-                self._job["proc"].wait()
+                # Bounded even here. A bare wait() meant a wedged FreeCAD hung
+                # a scripted or headless run forever, with only the modal path
+                # honouring the timeout. Same deadline either way, measured
+                # from when the process started.
+                remaining = FREECAD_TIMEOUT - (time.monotonic() - self._job_started)
+                try:
+                    self._job["proc"].wait(timeout=max(remaining, 0.0))
+                except subprocess.TimeoutExpired:
+                    job, self._job = self._job, None
+                    freecad_cleanup(job)
+                    self._fail(self._job_path,
+                               f"FreeCAD exceeded {int(FREECAD_TIMEOUT)}s and was stopped")
+                    return bool(self._queue)
             elif freecad_running(self._job):
                 if time.monotonic() - self._job_started > FREECAD_TIMEOUT:
                     job, self._job = self._job, None
@@ -1289,10 +1332,13 @@ class MV_OT_AddProductCollection(Operator):
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):
+        # Create unconditionally and report the name that came back. Skipping
+        # when the name was taken made the button look broken on the second
+        # press -- no collection, no message, nothing in the outliner.
         root = get_products_root()
-        n = self.name or "Product"
-        if bpy.data.collections.get(n) is None:
-            root.children.link(bpy.data.collections.new(n))
+        coll = bpy.data.collections.new(self.name or "Product")
+        root.children.link(coll)
+        self.report({'INFO'}, f"Added product collection '{coll.name}'.")
         return {'FINISHED'}
 
 
