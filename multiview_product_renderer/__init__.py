@@ -90,11 +90,14 @@ GUIDE_LINES = [
     "1. Scene Setup: pick a lighting preset and background, then Apply.",
     "2. Import: point to FreeCAD or STEPper, add STEP files, click Import.",
     "   Each file becomes a collection under MV_Products.",
-    "   Fit on Import scales each one into a Target Size cube at the origin.",
-    "   You can also create empty product collections and drop meshes in,",
-    "   then click Standardize Products to fit them the same way.",
-    "3. Cameras: pick a view set and front axis, click Build.",
-    "4. Render: set output folder, mode (full/clay/both), starting index,",
+    "   You can also create empty product collections and drop meshes in.",
+    "3. Standardize: centre and scale every product to one size, and fix",
+    "   the faceted shading a CAD tessellation arrives with. Fit on Import",
+    "   does the same automatically as each file lands.",
+    "4. Cameras: pick a view set and front axis, click Build.",
+    "   Then use Orient Products to walk the batch one at a time and turn",
+    "   anything that faces the wrong way, before rebuilding the cameras.",
+    "5. Render: set output folder, mode (full/clay/both), starting index,",
     "   then Render All. Files are named PREFIX_NN_Product_View.",
     "",
     "Render engine, samples, resolution and file format stay under your",
@@ -267,6 +270,19 @@ class MV_Settings(PropertyGroup):
     )
 
     show_products_list: BoolProperty(default=False)
+
+    active_product_index: IntProperty(
+        name="Active Product",
+        description="Which product the orientation buttons act on",
+        default=0, min=0,
+    )
+    rotate_step: FloatProperty(
+        name="Rotate Step",
+        description="How far one press of Left/Right/Up/Down turns the product",
+        default=math.radians(90.0),
+        min=math.radians(1.0), max=math.radians(180.0),
+        subtype='ANGLE',
+    )
 
 
 def ensure_collection(name, parent=None):
@@ -538,6 +554,78 @@ def find_layer_coll(layer_coll, name):
         if found:
             return found
     return None
+
+
+def isolate_product(context, name):
+    """Show one product and exclude the rest from the view layer.
+
+    Deliberately the same mechanism Render All uses rather than a viewport-only
+    hide, so stepping through products previews exactly what a batch will
+    render. Pass name=None to bring everything back.
+    """
+    for pc in get_products():
+        lc = find_layer_coll(context.view_layer.layer_collection, pc.name)
+        if lc:
+            lc.exclude = name is not None and pc.name != name
+
+
+def active_product(context):
+    """The product the orientation buttons act on, or None if there are none.
+
+    The stored index is clamped rather than trusted: products get deleted from
+    the outliner behind the add-on's back, and a stale index would otherwise
+    raise the moment someone pressed Rotate.
+    """
+    products = get_products()
+    if not products:
+        return None, -1
+    idx = min(max(context.scene.mv_settings.active_product_index, 0), len(products) - 1)
+    return products[idx], idx
+
+
+def view_right_axis(context):
+    """World-space axis that reads as horizontal in the camera being used.
+
+    Up and Down tip the product about whatever is horizontal on screen, so the
+    buttons behave the same whether you are looking through Front or Top. Falls
+    back to world Y when no camera exists to ask.
+    """
+    cam = context.scene.camera
+    if cam is None or cam.type != 'CAMERA':
+        cam_coll = bpy.data.collections.get(CAMERA_COLL)
+        cams = [o for o in cam_coll.objects if o.type == 'CAMERA'] if cam_coll else []
+        cam = cams[0] if cams else None
+    if cam is None:
+        return Vector((0.0, 1.0, 0.0))
+    axis = cam.matrix_world.col[0].xyz
+    return axis.normalized() if axis.length > 1e-9 else Vector((0.0, 1.0, 0.0))
+
+
+def rotate_product(context, coll, direction, step):
+    """Turn one product in place, as seen from the current view.
+
+    Left and Right spin about world Z, which is the turntable move that fixes a
+    product facing the wrong way. Up and Down tip about the view's horizontal
+    axis. Rotation happens around the product's own bounding box centre so it
+    does not drift out of frame, and is applied to the collection roots so a
+    multi-part assembly turns as one rigid body.
+    """
+    objs = collection_meshes(coll)
+    if not objs:
+        return False
+    center, _ = bbox_of(objs)
+    if direction in {'LEFT', 'RIGHT'}:
+        axis = Vector((0.0, 0.0, 1.0))
+        angle = -step if direction == 'LEFT' else step
+    else:
+        axis = view_right_axis(context)
+        angle = -step if direction == 'UP' else step
+    xform = (Matrix.Translation(center)
+             @ Matrix.Rotation(angle, 4, axis)
+             @ Matrix.Translation(-center))
+    for obj in collection_roots(coll):
+        obj.matrix_world = xform @ obj.matrix_world
+    return True
 
 
 def alpha_pair(idx):
@@ -1323,6 +1411,74 @@ class MV_OT_Standardize(Operator):
         return {'FINISHED'}
 
 
+class MV_OT_RotateProduct(Operator):
+    """Turn the active product 90 degrees so it faces the way the view set expects"""
+    bl_idname = "mv.rotate_product"
+    bl_label = "Rotate Product"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    direction: EnumProperty(
+        items=[('LEFT', "Left", "Spin left about the vertical axis"),
+               ('RIGHT', "Right", "Spin right about the vertical axis"),
+               ('UP', "Up", "Tip the front face up"),
+               ('DOWN', "Down", "Tip the front face down")],
+        default='LEFT',
+    )
+
+    def execute(self, context):
+        coll, _ = active_product(context)
+        if coll is None:
+            self.report({'ERROR'}, f"No product collections under '{PRODUCT_COLL}'.")
+            return {'CANCELLED'}
+        step = context.scene.mv_settings.rotate_step
+        if not rotate_product(context, coll, self.direction, step):
+            self.report({'WARNING'}, f"'{coll.name}' has no geometry to rotate.")
+            return {'CANCELLED'}
+        self.report({'INFO'},
+                    f"Rotated {coll.name} {self.direction.lower()} "
+                    f"{math.degrees(step):.0f} degrees.")
+        return {'FINISHED'}
+
+
+class MV_OT_ProductStep(Operator):
+    """Show the next or previous product on its own, hiding the others"""
+    bl_idname = "mv.product_step"
+    bl_label = "Step Product"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    delta: IntProperty(default=1)
+
+    def execute(self, context):
+        products = get_products()
+        if not products:
+            self.report({'ERROR'}, f"No product collections under '{PRODUCT_COLL}'.")
+            return {'CANCELLED'}
+        s = context.scene.mv_settings
+        _, idx = active_product(context)
+        # Wraps, so a review pass round a batch never dead-ends on the last one.
+        idx = (idx + self.delta) % len(products)
+        s.active_product_index = idx
+        isolate_product(context, products[idx].name)
+        self.report({'INFO'}, f"{products[idx].name}  ({idx + 1}/{len(products)})")
+        return {'FINISHED'}
+
+
+class MV_OT_ShowAllProducts(Operator):
+    """Bring every product back into the view layer"""
+    bl_idname = "mv.show_all_products"
+    bl_label = "Show All"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        products = get_products()
+        if not products:
+            self.report({'ERROR'}, f"No product collections under '{PRODUCT_COLL}'.")
+            return {'CANCELLED'}
+        isolate_product(context, None)
+        self.report({'INFO'}, f"Showing all {len(products)} product(s).")
+        return {'FINISHED'}
+
+
 class MV_OT_AddProductCollection(Operator):
     bl_idname = "mv.add_product_collection"
     bl_label = "Add Empty Product Collection"
@@ -1558,22 +1714,35 @@ class MV_PT_Import(Panel):
                 for pc in prods:
                     box.label(text=f"{pc.name}  ({len(pc.all_objects)} objs)", icon='OUTLINER_COLLECTION')
 
+class MV_PT_Standardize(Panel):
+    bl_label = "Standardize"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "MultiView"
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.mv_settings
+
+        layout.prop(s, "fit_on_import")
+        layout.label(text="Runs as each STEP file lands.", icon='INFO')
+
         layout.separator()
-        box = layout.box()
-        box.label(text="Standardization:")
-        box.prop(s, "fit_on_import")
-        row = box.row(align=True)
+        row = layout.row(align=True)
         row.prop(s, "recenter", toggle=True)
         row.prop(s, "rescale", toggle=True)
-        sub = box.row()
+        sub = layout.row()
         sub.enabled = s.rescale or s.fit_on_import
         sub.prop(s, "target_size")
-        row = box.row(align=True)
+
+        row = layout.row(align=True)
         row.prop(s, "auto_smooth", toggle=True)
         sub = row.row()
         sub.enabled = s.auto_smooth
         sub.prop(s, "smooth_angle", text="")
-        box.operator("mv.standardize", icon='FULLSCREEN_EXIT')
+
+        layout.separator()
+        layout.operator("mv.standardize", icon='FULLSCREEN_EXIT')
 
 
 class MV_PT_Cameras(Panel):
@@ -1595,6 +1764,34 @@ class MV_PT_Cameras(Panel):
         row.column(align=True).operator("mv.add_custom_view", text="", icon='ADD')
 
         layout.operator("mv.build_cameras", icon='CAMERA_DATA')
+
+        layout.separator()
+        box = layout.box()
+        box.label(text="Orient Products:")
+
+        products = get_products()
+        if not products:
+            box.label(text="No products to orient.", icon='INFO')
+            return
+
+        coll, idx = active_product(context)
+        box.label(text=f"{coll.name}  ({idx + 1}/{len(products)})",
+                  icon='OUTLINER_COLLECTION')
+        box.prop(s, "rotate_step")
+
+        col = box.column(align=True)
+        row = col.row(align=True)
+        row.operator("mv.rotate_product", text="Left", icon='TRIA_LEFT').direction = 'LEFT'
+        row.operator("mv.rotate_product", text="Right", icon='TRIA_RIGHT').direction = 'RIGHT'
+        row = col.row(align=True)
+        row.operator("mv.rotate_product", text="Up", icon='TRIA_UP').direction = 'UP'
+        row.operator("mv.rotate_product", text="Down", icon='TRIA_DOWN').direction = 'DOWN'
+
+        row = box.row(align=True)
+        row.operator("mv.product_step", text="Previous", icon='FRAME_PREV').delta = -1
+        row.operator("mv.product_step", text="Next", icon='FRAME_NEXT').delta = 1
+        box.operator("mv.show_all_products", icon='HIDE_OFF')
+        box.label(text="Rebuild cameras after rotating to reframe.", icon='INFO')
 
 
 class MV_PT_Render(Panel):
@@ -1651,12 +1848,17 @@ classes = (
     MV_OT_RemoveCustomView,
     MV_OT_AddProductCollection,
     MV_OT_Standardize,
+    MV_OT_RotateProduct,
+    MV_OT_ProductStep,
+    MV_OT_ShowAllProducts,
     MV_OT_RenderAll,
     MV_UL_StepFiles,
     MV_UL_CustomViews,
+    # Panels draw in the sidebar in the order they are registered.
     MV_PT_Guide,
     MV_PT_SceneSetup,
     MV_PT_Import,
+    MV_PT_Standardize,
     MV_PT_Cameras,
     MV_PT_Render,
 )

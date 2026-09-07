@@ -113,7 +113,11 @@ to see the full list.
 You can also click **Add Empty Product Collection** and drag existing meshes into it, which
 is how you use MultiView with geometry that didn't come from STEP.
 
-**Fit on Import** (on by default) does this automatically: as each STEP file lands, the
+### 3. Standardize
+
+Everything that makes products comparable to each other lives in this panel.
+
+**Fit on Import** (on by default) does it automatically: as each STEP file lands, the
 product is uniformly scaled so its largest dimension equals **Target Size** (default
 `1.0 m`, i.e. it fits inside a 1x1x1 m cube) and its bounding box is centred on the world
 origin. Turn it off if you want to place and scale products yourself.
@@ -145,7 +149,7 @@ on the world origin, so the product rotates about its own centre and the N panel
 Geometry does not move during that step. Objects on multi-user or linked data cannot be
 edited by Blender, so those keep their transform and are counted in the status message.
 
-### 3. Cameras / Views
+### 4. Cameras / Views
 
 Choose a view set and click **Build Cameras**. Cameras land in `MV_Cameras`, named
 `MV_Cam_<View>`.
@@ -171,7 +175,34 @@ product reads at the same scale across the whole sheet rather than being re-fitt
 Need an angle that isn't in the presets? Add a **Custom View** with an X/Y/Z direction
 vector and an ortho/perspective toggle, and it gets built alongside the rest.
 
-### 4. Batch Render
+#### Orient Products
+
+**Front Axis** fixes the whole batch at once, which only helps when every product was
+modelled the same way. In practice a few arrive facing the wrong way, and this is where you
+turn them by hand.
+
+**Previous** and **Next** step through the batch one product at a time, showing the current
+one and excluding the rest. That is the same isolation **Render All** uses, so what you see
+is what that product's render will contain. The list wraps, so you can keep pressing
+**Next** all the way round. **Show All** brings everything back when you are done.
+
+**Left**, **Right**, **Up** and **Down** turn the product that is currently showing:
+
+| Button | What it does |
+| --- | --- |
+| **Left** / **Right** | Spins the product about the vertical axis — the turntable move that swings a sideways product round to face front. |
+| **Up** / **Down** | Tips the product about whatever axis is horizontal on your screen, for something lying on its back or standing on its nose. |
+
+Up and Down follow the camera, so they mean the same thing whichever view you are looking
+through. Rotation is about the product's own centre, so it never drifts out of frame, and a
+multi-part assembly turns as one rigid piece. **Rotate Step** sets how far one press turns
+it — 90° by default, so four presses of the same button return to where you started.
+
+Turning a product changes its bounding box, so **click Build Cameras again once you are
+done orienting**. Framing is measured across the whole batch, and it is measured before you
+start rotating.
+
+### 5. Batch Render
 
 Set an **Output Directory**, choose a **Render Mode**, and hit **Render All**.
 
@@ -246,11 +277,18 @@ collection are not seen as products.
 `freecadcmd`, not the GUI `freecad` binary. Open `Window → Toggle System Console` (Windows)
 to see the subprocess output.
 
-**Products are all different sizes in the renders**: run *Standardize Products* with
-**Rescale** enabled.
+**Products are all different sizes in the renders**: run *Standardize Products* in the
+Standardize panel with **Rescale** enabled.
 
 **The "Front" view isn't the front**: change **Front Axis** in Cameras / Views and rebuild
-the cameras.
+the cameras. If only some products are wrong, Front Axis will not help — it moves the whole
+batch. Use *Orient Products* to turn the offenders individually, then rebuild.
+
+**Only one product is visible in the viewport**: you left a *Previous* / *Next* review pass
+part way through, which excludes the others. Click **Show All** in Cameras / Views.
+
+**Renders are cropped after rotating products**: rotating changes the bounding box the
+framing was measured from. Click *Build Cameras* again.
 
 **Imported STEP geometry is blocky**: lower **Tessellation Deflection** in preferences
 (try `0.02`) and re-import.
