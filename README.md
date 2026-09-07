@@ -84,7 +84,7 @@ The sidebar is laid out in the order you should use it.
 Pick a lighting preset and a background, then **Apply Scene Setup**. This builds an
 `MV_Lighting` collection and switches the scene to the add-on's own `MV_World`.
 
-Your existing world is left intact — it is only deselected, not edited, so an HDRI setup
+Your existing world is left intact. It is only deselected, not edited, so an HDRI setup
 you built yourself survives and can be picked again from World properties.
 
 | Lighting preset | Look |
@@ -187,7 +187,7 @@ batch while you are trying to orient it. The checkbox applies the moment you tic
 unticking it brings everything back.
 
 That is the same isolation **Render All** uses, so what you see is what that product's
-render will contain. It is viewport state only — a batch render saves it, isolates each
+render will contain. It is viewport state only: a batch render saves it, isolates each
 product in turn, and puts it back afterwards, so leaving it switched on never changes what
 gets rendered.
 
@@ -199,13 +199,13 @@ switches the checkbox off, so the next rotation does not immediately hide them a
 
 | Button | What it does |
 | --- | --- |
-| **Left** / **Right** | Spins the product about the vertical axis — the turntable move that swings a sideways product round to face front. |
+| **Left** / **Right** | Spins the product about the vertical axis. This is the turntable move that swings a sideways product round to face front. |
 | **Up** / **Down** | Tips the product about whatever axis is horizontal on your screen, for something lying on its back or standing on its nose. |
 
 Up and Down follow the camera, so they mean the same thing whichever view you are looking
 through. Rotation is about the product's own centre, so it never drifts out of frame, and a
 multi-part assembly turns as one rigid piece. **Rotate Step** sets how far one press turns
-it — 90° by default, so four presses of the same button return to where you started.
+it, 90 degrees by default, so four presses of the same button return to where you started.
 
 Turning a product changes its bounding box, so **click Build Cameras again once you are
 done orienting**. Framing is measured across the whole batch, and it is measured before you
@@ -249,7 +249,7 @@ renders/
 The `AA_01` label is controlled by three fields:
 
 - **Start Prefix**: the letter pair for the first product (`AA`, `BB`, ...). Only the
-  first character is read, since the label just repeats it — typing `AB` gives `AA`.
+  first character is read, since the label just repeats it, so typing `AB` gives `AA`.
 - **Start Number**: the number the batch starts at, so a second batch can continue from
   `AA_11` instead of restarting at `AA_01`.
 - **Products per Letter**: how many products before the prefix rolls over to the next
@@ -290,7 +290,7 @@ to see the subprocess output.
 Standardize panel with **Rescale** enabled.
 
 **The "Front" view isn't the front**: change **Front Axis** in Cameras / Views and rebuild
-the cameras. If only some products are wrong, Front Axis will not help — it moves the whole
+the cameras. If only some products are wrong, Front Axis will not help, because it moves the whole
 batch. Use *Orient Products* to turn the offenders individually, then rebuild.
 
 **Only one product is visible in the viewport**: **Isolate Active Product** is on, which is
