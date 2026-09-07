@@ -1,2 +1,22 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Store every text file as LF in the repository AND check it out as LF.
+# `eol=lf` is what makes this stick: without it the checkout follows the
+# machine's core.autocrlf, which is `true` on a default Git for Windows
+# install and rewrites these files as CRLF. Python and Blender read LF fine on
+# Windows, so pinning LF keeps the working tree byte-identical on every OS.
+* text=auto eol=lf
+
+# Binaries: never inspected for line endings, never rewritten.
+*.blend binary
+*.blend1 binary
+*.blend2 binary
+*.step binary
+*.stp  binary
+*.STEP binary
+*.STP  binary
+*.obj  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.exr  binary
+*.hdr  binary
+*.zip  binary
