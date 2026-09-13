@@ -675,6 +675,38 @@ def product_label(start_prefix, start_number, offset, per_letter):
     return f"{alpha_pair(base + bumps)}_{num:02d}"
 
 
+# Characters Windows refuses outright, plus the separators that would quietly
+# redirect a write into some other directory.
+BAD_PATH_CHARS = '<>:"/\\|?*'
+RESERVED_NAMES = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
+def safe_name(name, fallback="unnamed"):
+    """A collection or view name reduced to one usable path component.
+
+    These names are free text and usually arrive from a STEP filename, so they
+    carry whatever the CAD export happened to contain. A trailing space is the
+    one that bites: asked for 'BICON ', Windows quietly creates 'BICON', then
+    refuses to write 'BICON \\shot.png' because that directory really does not
+    exist, and the render dies on the first product with 'cannot save'. The
+    mismatch hides well, because os.path.isdir strips the same trailing space
+    on the way in and cheerfully agrees the folder is there.
+    """
+    cleaned = "".join(
+        "_" if c in BAD_PATH_CHARS or ord(c) < 32 else c for c in str(name)
+    )
+    # The name we ask for has to match the name the filesystem will hand back,
+    # or every later write into it misses.
+    cleaned = cleaned.strip().rstrip(" .")
+    if cleaned.split(".")[0].upper() in RESERVED_NAMES:
+        cleaned = f"_{cleaned}"
+    return cleaned or fallback
+
+
 STEPPER_OPERATORS = (
     "import_scene.occ_import_step",
     "import_scene.occ",
@@ -1607,13 +1639,13 @@ class MV_OT_RenderAll(Operator):
                         lc.exclude = (other.name != pc.name)
 
                 label = product_label(s.start_prefix, s.start_number, i, s.products_per_letter)
-                product_dir = os.path.join(out_root, f"{label}_{pc.name}")
+                product_dir = os.path.join(out_root, safe_name(f"{label}_{pc.name}"))
                 os.makedirs(product_dir, exist_ok=True)
 
                 for cam in cameras:
                     scene.camera = cam
                     view_name = cam.name.replace("MV_Cam_", "")
-                    base = f"{label}_{pc.name}_{view_name}"
+                    base = safe_name(f"{label}_{pc.name}_{view_name}")
 
                     if mode == 'FULL':
                         _do_full_render(scene, os.path.join(product_dir, base))
