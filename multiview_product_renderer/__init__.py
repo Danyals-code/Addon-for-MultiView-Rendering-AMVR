@@ -313,11 +313,23 @@ def ensure_collection(name, parent=None):
 
 
 def get_products_root():
+    """The MV_Products collection, created if it is not there yet.
+
+    Only for operators. Panels read the products with get_products(), which
+    never creates anything: draw() runs on every redraw, so reaching for the
+    root here linked an MV_Products collection into the scene merely because
+    someone opened the sidebar, and left their file marked as modified for it.
+    """
     return ensure_collection(PRODUCT_COLL)
 
 
 def get_products():
-    return list(get_products_root().children)
+    """Product collections, or [] when the root does not exist yet.
+
+    Read-only on purpose -- see get_products_root().
+    """
+    root = bpy.data.collections.get(PRODUCT_COLL)
+    return list(root.children) if root else []
 
 
 def bbox_of(objs):
@@ -1825,6 +1837,7 @@ class MV_PT_Import(Panel):
             else:
                 for pc in prods:
                     box.label(text=f"{pc.name}  ({len(pc.all_objects)} objs)", icon='OUTLINER_COLLECTION')
+
 
 class MV_PT_Standardize(Panel):
     bl_label = "Standardize"
