@@ -313,11 +313,23 @@ def ensure_collection(name, parent=None):
 
 
 def get_products_root():
+    """The MV_Products collection, created if it is not there yet.
+
+    Only for operators. Panels read the products with get_products(), which
+    never creates anything: draw() runs on every redraw, so reaching for the
+    root here linked an MV_Products collection into the scene merely because
+    someone opened the sidebar, and left their file marked as modified for it.
+    """
     return ensure_collection(PRODUCT_COLL)
 
 
 def get_products():
-    return list(get_products_root().children)
+    """Product collections, or [] when the root does not exist yet.
+
+    Read-only on purpose -- see get_products_root().
+    """
+    root = bpy.data.collections.get(PRODUCT_COLL)
+    return list(root.children) if root else []
 
 
 def bbox_of(objs):
@@ -673,6 +685,38 @@ def product_label(start_prefix, start_number, offset, per_letter):
     bumps = linear // per_letter
     num = (linear % per_letter) + 1
     return f"{alpha_pair(base + bumps)}_{num:02d}"
+
+
+# Characters Windows refuses outright, plus the separators that would quietly
+# redirect a write into some other directory.
+BAD_PATH_CHARS = '<>:"/\\|?*'
+RESERVED_NAMES = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
+def safe_name(name, fallback="unnamed"):
+    """A collection or view name reduced to one usable path component.
+
+    These names are free text and usually arrive from a STEP filename, so they
+    carry whatever the CAD export happened to contain. A trailing space is the
+    one that bites: asked for 'BICON ', Windows quietly creates 'BICON', then
+    refuses to write 'BICON \\shot.png' because that directory really does not
+    exist, and the render dies on the first product with 'cannot save'. The
+    mismatch hides well, because os.path.isdir strips the same trailing space
+    on the way in and cheerfully agrees the folder is there.
+    """
+    cleaned = "".join(
+        "_" if c in BAD_PATH_CHARS or ord(c) < 32 else c for c in str(name)
+    )
+    # The name we ask for has to match the name the filesystem will hand back,
+    # or every later write into it misses.
+    cleaned = cleaned.strip().rstrip(" .")
+    if cleaned.split(".")[0].upper() in RESERVED_NAMES:
+        cleaned = f"_{cleaned}"
+    return cleaned or fallback
 
 
 STEPPER_OPERATORS = (
@@ -1563,9 +1607,28 @@ def _do_clay_render(scene, filepath, clay_color):
         scene.display.shading.show_cavity = saved['show_cavity']
 
 
+class _BatchAborted(Exception):
+    """Stop the batch early without dumping a traceback on the user."""
+
+
 class MV_OT_RenderAll(Operator):
     bl_idname = "mv.render_all"
     bl_label = "Render All"
+
+    def _fail(self, failures, done, path, exc):
+        """Record one failed write, aborting the batch if nothing has landed.
+
+        Collected and reported at the end rather than raised, so a single
+        unwritable file cannot throw away a long batch that is otherwise fine.
+        Before the first success there is nothing to salvage and the cause is
+        almost always the setup, so that case stops immediately instead of
+        failing the same way for every remaining image.
+        """
+        note = f"{os.path.basename(path)}: {exc}"
+        failures.append(note)
+        print(f"[MultiView] FAILED {note}")
+        if not done:
+            raise _BatchAborted from exc
 
     def execute(self, context):
         scene = context.scene
@@ -1583,7 +1646,11 @@ class MV_OT_RenderAll(Operator):
             return {'CANCELLED'}
 
         out_root = bpy.path.abspath(s.render_output_dir)
-        os.makedirs(out_root, exist_ok=True)
+        try:
+            os.makedirs(out_root, exist_ok=True)
+        except OSError as exc:
+            self.report({'ERROR'}, f"Cannot use output folder '{out_root}': {exc}")
+            return {'CANCELLED'}
 
         saved_hide = {}
         for pc in products:
@@ -1598,6 +1665,7 @@ class MV_OT_RenderAll(Operator):
         total_per_pair = (2 if both else 1) * len(cameras)
         total = len(products) * total_per_pair
         done = 0
+        failures = []
 
         try:
             for i, pc in enumerate(products):
@@ -1607,28 +1675,42 @@ class MV_OT_RenderAll(Operator):
                         lc.exclude = (other.name != pc.name)
 
                 label = product_label(s.start_prefix, s.start_number, i, s.products_per_letter)
-                product_dir = os.path.join(out_root, f"{label}_{pc.name}")
-                os.makedirs(product_dir, exist_ok=True)
+                product_dir = os.path.join(out_root, safe_name(f"{label}_{pc.name}"))
+                try:
+                    os.makedirs(product_dir, exist_ok=True)
+                except OSError as exc:
+                    self._fail(failures, done, product_dir, exc)
+                    continue
 
                 for cam in cameras:
                     scene.camera = cam
                     view_name = cam.name.replace("MV_Cam_", "")
-                    base = f"{label}_{pc.name}_{view_name}"
+                    base = safe_name(f"{label}_{pc.name}_{view_name}")
 
+                    clay = (tuple(s.clay_color),)
                     if mode == 'FULL':
-                        _do_full_render(scene, os.path.join(product_dir, base))
-                        done += 1
+                        attempts = ((_do_full_render, base, ()),)
                     elif mode == 'CLAY':
-                        _do_clay_render(scene, os.path.join(product_dir, base + "_clay"),
-                                        tuple(s.clay_color))
-                        done += 1
+                        attempts = ((_do_clay_render, base + "_clay", clay),)
                     else:
-                        _do_full_render(scene, os.path.join(product_dir, base + "_render"))
+                        attempts = ((_do_full_render, base + "_render", ()),
+                                    (_do_clay_render, base + "_clay", clay))
+
+                    for render, name, extra in attempts:
+                        path = os.path.join(product_dir, name)
+                        try:
+                            render(scene, path, *extra)
+                        except RuntimeError as exc:
+                            # bpy.ops.render.render raises when the image cannot
+                            # be written. Letting that escape put a Python
+                            # traceback in front of the user instead of the name
+                            # of the file that failed.
+                            self._fail(failures, done, path, exc)
+                            continue
                         done += 1
-                        _do_clay_render(scene, os.path.join(product_dir, base + "_clay"),
-                                        tuple(s.clay_color))
-                        done += 1
-                    print(f"[MultiView] {done}/{total}: {scene.render.filepath}")
+                        print(f"[MultiView] {done}/{total}: {scene.render.filepath}")
+        except _BatchAborted:
+            pass
         finally:
             for pc in products:
                 lc = find_layer_coll(context.view_layer.layer_collection, pc.name)
@@ -1637,7 +1719,19 @@ class MV_OT_RenderAll(Operator):
             scene.camera = saved_cam
             scene.render.filepath = saved_path
 
-        self.report({'INFO'}, f"Wrote {done} image(s).")
+        if not failures:
+            self.report({'INFO'}, f"Wrote {done} image(s).")
+            return {'FINISHED'}
+
+        if not done:
+            # Nothing landed at all, so the batch stopped at the first failure
+            # rather than burning render time failing the same way every time.
+            self.report({'ERROR'}, f"Nothing rendered. {failures[0]}")
+            return {'CANCELLED'}
+
+        self.report({'WARNING'},
+                    f"Wrote {done} of {total} image(s). {len(failures)} failed, "
+                    f"first: {failures[0]}. Full list in the System Console.")
         return {'FINISHED'}
 
 
@@ -1743,6 +1837,7 @@ class MV_PT_Import(Panel):
             else:
                 for pc in prods:
                     box.label(text=f"{pc.name}  ({len(pc.all_objects)} objs)", icon='OUTLINER_COLLECTION')
+
 
 class MV_PT_Standardize(Panel):
     bl_label = "Standardize"
