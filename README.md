@@ -2,13 +2,13 @@
 
 A Blender add-on for turning CAD products into consistent, batch-rendered image sets.
 
-Import STEP files, standardize them at the world origin, build a rig of orthographic and
+Import STEP and STL files, standardize them at the world origin, build a rig of orthographic and
 perspective cameras plus 3-point studio lighting, then render every product across every
 view in one click, with predictable file names like `AA_01_Widget_Front_clay.png`.
 
 - **Blender:** 4.0 and newer
 - **Panel location:** `3D Viewport → Sidebar (N key) → MultiView`
-- **Version:** 1.3.0
+- **Version:** 1.4.0
 
 ---
 
@@ -48,13 +48,18 @@ Restart Blender and enable the add-on as in step 4 above.
 You only need this if you want to import `.step` / `.stp` files directly. If you already
 have meshes in your scene, skip it. The add-on works with any geometry.
 
+**`.stl` files need none of this.** An STL already holds a mesh, so it is imported straight
+through Blender and never touches FreeCAD or STEPper, whatever the STEP Import Mode is set
+to. From the moment it lands it is treated exactly like a converted STEP file: same product
+collection, same Fit on Import, same standardizing, same batch render and file naming.
+
 Open `Edit → Preferences → Add-ons → MultiView Product Renderer` and expand the
 preferences:
 
 | Setting | What it does |
 | --- | --- |
-| **STEP Import Mode** | `Auto` tries the STEPper add-on first, then falls back to FreeCAD. Or force one. |
-| **FreeCAD Executable** | Path to `freecadcmd.exe` (Windows) or `freecadcmd` (macOS/Linux). |
+| **STEP Import Mode** | `Auto` tries the STEPper add-on first, then falls back to FreeCAD. Or force one. STEP only; STL ignores it. |
+| **FreeCAD Executable** | Path to `freecadcmd.exe` (Windows) or `freecadcmd` (macOS/Linux). STEP only. |
 | **Tessellation Deflection** | FreeCAD mode only. Lower = finer mesh, bigger files. Default `0.1`. |
 
 **FreeCAD route**: install [FreeCAD](https://www.freecad.org/) and point the preference at
@@ -100,9 +105,10 @@ either half on its own.
 
 ### 2. Import Products
 
-Add one or more STEP files to the list and click **Import STEP Files**. Each file becomes
-its own collection under `MV_Products`. That grouping is what the batch renderer iterates
-over.
+Add one or more `.step` / `.stp` / `.stl` files to the list and click **Import CAD Files**.
+Each file becomes its own collection under `MV_Products`. That grouping is what the batch
+renderer iterates over. You can mix STEP and STL freely in one list; each file is routed by
+its extension, and a file that fails does not stop the ones after it.
 
 Import runs in the background: the status bar shows `MultiView: 3/12 housing.step
 (converting)`, Blender stays responsive, and **Esc** cancels after the file in flight.
@@ -110,14 +116,18 @@ Files that fail are skipped rather than stopping the batch, and FreeCAD's own er
 message is reported instead of a generic failure -- run `Window > Toggle System Console`
 to see the full list.
 
+STL files skip the conversion step entirely, so they land immediately rather than showing
+`(converting)`. A `.stl` that Blender cannot read is reported and skipped rather than
+becoming an empty product collection that would render as blank frames.
+
 You can also click **Add Empty Product Collection** and drag existing meshes into it, which
-is how you use MultiView with geometry that didn't come from STEP.
+is how you use MultiView with geometry that didn't come from a CAD file.
 
 ### 3. Standardize
 
 Everything that makes products comparable to each other lives in this panel.
 
-**Fit on Import** (on by default) does it automatically: as each STEP file lands, the
+**Fit on Import** (on by default) does it automatically: as each file lands, the
 product is uniformly scaled so its largest dimension equals **Target Size** (default
 `1.0 m`, i.e. it fits inside a 1x1x1 m cube) and its bounding box is centred on the world
 origin. Turn it off if you want to place and scale products yourself.
@@ -224,6 +234,26 @@ Set an **Output Directory**, choose a **Render Mode**, and hit **Render All**.
 Every product is isolated in turn (all others excluded from the view layer), so nothing
 bleeds between shots. Progress prints to the system console.
 
+**Only products are isolated.** Geometry that lives outside `MV_Products` is not a product,
+so it is never hidden and turns up in every shot of every product. The usual offender is the
+cube Blender starts a new file with: two metres across, sitting on the world origin exactly
+where a fitted product lands, and quite capable of filling the frame and hiding the product
+behind it -- which reads as a blank render with no obvious cause.
+
+The panel warns before you spend the render time:
+
+```
+[!] 1 object(s) outside MV_Products
+    appear in every render:
+      Cube
+    Delete them, move them into a
+    product, or switch off their
+    render visibility (camera icon).
+```
+
+Objects you have already switched off for rendering are not listed, so a deliberate backdrop
+or staging rig does not keep setting the warning off.
+
 **Render engine, sample count, resolution, and file format stay in Blender's own Output and
 Render Properties.** MultiView only drives cameras, visibility, and file paths. It never
 overwrites your render settings, and the clay pass restores your engine when it finishes.
@@ -278,7 +308,12 @@ products, and any other world in the file, are never touched.
 
 **"No cameras. Build cameras first."**: run *Build Cameras* in the Cameras / Views panel.
 
-**"No product collections under 'MV_Products'."**: import a STEP file, or add an empty
+**Renders come back blank, or with something unexpected in them**: check the warning above
+**Render All**. Anything outside `MV_Products` is rendered along with every product, and a
+large object near the origin can hide the product completely. Delete it, move it into a
+product collection, or turn off its render visibility.
+
+**"No product collections under 'MV_Products'."**: import a STEP or STL file, or add an empty
 product collection and put your meshes inside it. Meshes sitting loose in the scene
 collection are not seen as products.
 

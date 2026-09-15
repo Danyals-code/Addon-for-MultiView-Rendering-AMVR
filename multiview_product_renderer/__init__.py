@@ -1,10 +1,10 @@
 bl_info = {
     "name": "MultiView Product Renderer",
     "author": "Danyal Sarfraz",
-    "version": (1, 3, 0),
+    "version": (1, 4, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > MultiView",
-    "description": "Import STEP files, set up cameras and 3-point lighting, batch render products across views.",
+    "description": "Import STEP and STL files, set up cameras and 3-point lighting, batch render products across views.",
     "category": "Render",
 }
 
@@ -81,6 +81,10 @@ LIGHTING_PRESETS = {
     },
 }
 
+# Object types that put something in front of a camera. Lights and cameras
+# are not here; neither are empties, which only carry a transform.
+GEOMETRY_TYPES = {'MESH', 'CURVE', 'SURFACE', 'META', 'FONT'}
+
 CAMERA_COLL = "MV_Cameras"
 LIGHT_COLL = "MV_Lighting"
 PRODUCT_COLL = "MV_Products"
@@ -88,7 +92,8 @@ WORLD_NAME = "MV_World"
 
 GUIDE_LINES = [
     "1. Scene Setup: pick a lighting preset and background, then Apply.",
-    "2. Import: point to FreeCAD or STEPper, add STEP files, click Import.",
+    "2. Import: add STEP or STL files, then click Import. STEP needs",
+    "   FreeCAD or STEPper; STL is already a mesh and imports directly.",
     "   Each file becomes a collection under MV_Products.",
     "   You can also create empty product collections and drop meshes in.",
     "3. Standardize: centre and scale every product to one size, and fix",
@@ -99,6 +104,8 @@ GUIDE_LINES = [
     "   anything that faces the wrong way, before rebuilding the cameras.",
     "5. Render: set output folder, mode (full/clay/both), starting index,",
     "   then Render All. Files are named PREFIX_NN_Product_View.",
+    "   Only products are hidden between shots, so anything outside",
+    "   MV_Products lands in every image. The panel warns you first.",
     "",
     "Render engine, samples, resolution and file format stay under your",
     "control in Blender's Output and Render properties.",
@@ -110,6 +117,8 @@ class MV_AddonPreferences(AddonPreferences):
 
     step_import_mode: EnumProperty(
         name="STEP Import Mode",
+        description="How STEP files are turned into meshes. STL files are meshes "
+                    "already and ignore this, importing straight through Blender",
         items=[
             ('AUTO', "Auto", "Try STEPper first, then FreeCAD"),
             ('STEPPER', "STEPper Addon", "Use the STEPper addon"),
@@ -120,7 +129,8 @@ class MV_AddonPreferences(AddonPreferences):
     freecad_path: StringProperty(
         name="FreeCAD Executable",
         subtype='FILE_PATH',
-        description="Path to freecadcmd.exe (Windows) or freecadcmd (Linux/Mac)",
+        description="Path to freecadcmd.exe (Windows) or freecadcmd (Linux/Mac). "
+                    "STEP files only",
         default="",
     )
     tessellation_deflection: FloatProperty(
@@ -332,11 +342,46 @@ def get_products():
     return list(root.children) if root else []
 
 
+def stray_render_objects(context):
+    """Renderable geometry that belongs to no product.
+
+    Render All hides the other products while each one is photographed, but
+    anything outside MV_Products is left standing in shot. Most often that is
+    Blender's startup cube: two metres across, parked on the world origin
+    exactly where a fitted product lands, and big enough to swallow it whole.
+    The renders come back looking blank and the cause is nowhere near the
+    add-on's settings.
+
+    Objects already switched off for rendering are not reported, by their own
+    toggle or by every collection holding them. Someone who parked a backdrop
+    and disabled it meant to do that, and a warning that fires on deliberate
+    staging is one people learn to scroll past.
+
+    Read-only, and reaches for get_products() rather than get_products_root():
+    this runs from draw(), which must not create anything.
+    """
+    products = set()
+    for pc in get_products():
+        products.update(pc.all_objects)
+
+    strays = []
+    for obj in context.view_layer.objects:
+        if obj.type not in GEOMETRY_TYPES or obj in products or obj.hide_render:
+            continue
+        # An object linked into several collections still renders as long as
+        # one of them is on, so this takes all() rather than any().
+        holders = obj.users_collection
+        if holders and all(c.hide_render for c in holders):
+            continue
+        strays.append(obj)
+    return strays
+
+
 def bbox_of(objs):
     lo = Vector((float("inf"),) * 3)
     hi = Vector((float("-inf"),) * 3)
     for o in objs:
-        if o.type not in {'MESH', 'CURVE', 'SURFACE', 'META', 'FONT'}:
+        if o.type not in GEOMETRY_TYPES:
             continue
         for corner in o.bound_box:
             world = o.matrix_world @ Vector(corner)
@@ -393,7 +438,7 @@ def clear_collection_objects(coll):
 
 
 def collection_meshes(coll):
-    return [o for o in coll.all_objects if o.type in {'MESH', 'CURVE', 'SURFACE', 'META', 'FONT'}]
+    return [o for o in coll.all_objects if o.type in GEOMETRY_TYPES]
 
 
 def collection_roots(coll):
@@ -717,6 +762,75 @@ def safe_name(name, fallback="unnamed"):
     if cleaned.split(".")[0].upper() in RESERVED_NAMES:
         cleaned = f"_{cleaned}"
     return cleaned or fallback
+
+
+STL_EXTENSIONS = {".stl"}
+
+# Blender 4.2 replaced the Python STL importer with a C++ one under a new name
+# and retired the old operator soon after, so both are tried in turn. Forward
+# Y / up Z is the identity mapping and is what CAD writes; it is passed
+# explicitly rather than trusting an importer default to stay put.
+STL_OPERATORS = (
+    ("wm.stl_import", {"forward_axis": 'Y', "up_axis": 'Z'}),
+    ("import_mesh.stl", {"axis_forward": 'Y', "axis_up": 'Z'}),
+)
+
+
+def is_stl(path):
+    return os.path.splitext(path)[1].lower() in STL_EXTENSIONS
+
+
+def import_stl_file(path):
+    """Import an STL straight into the scene. True only on a real success.
+
+    An STL already holds a mesh, so it needs neither STEPper nor the FreeCAD
+    round trip a STEP file goes through. Everything after this point -- the
+    product collection, fitting, standardizing, rendering -- treats what lands
+    here exactly like a converted STEP file.
+
+    Calling an operator Blender does not have raises rather than returning, so
+    a missing name falls through to the next candidate; a genuine read failure
+    exhausts the list and reports False, which keeps one bad file from taking
+    the rest of the batch down with it.
+    """
+    for op_path, axes in STL_OPERATORS:
+        module, func = op_path.split(".", 1)
+        mod = getattr(bpy.ops, module, None)
+        op = getattr(mod, func, None) if mod else None
+        if op is None:
+            continue
+        try:
+            try:
+                return 'FINISHED' in op(filepath=path, **axes)
+            except TypeError:
+                return 'FINISHED' in op(filepath=path)
+        except Exception:
+            continue
+    return False
+
+
+def has_geometry(objs):
+    """True when at least one of these objects carries geometry worth keeping.
+
+    Object count alone is not enough. Blender's STL importer reports success on
+    a file that is not an STL at all and hands back an empty mesh, and a
+    FreeCAD OBJ can arrive the same way. An empty product collection is not a
+    harmless no-op: it picks up a camera rig, joins the batch, and renders as
+    blank frames across every view rather than being reported as a bad file.
+    """
+    for obj in objs:
+        data = getattr(obj, "data", None)
+        if data is None:
+            continue
+        if obj.type == 'MESH':
+            if len(data.vertices):
+                return True
+        elif obj.type == 'CURVE':
+            if len(data.splines):
+                return True
+        elif obj.type in {'SURFACE', 'META', 'FONT'}:
+            return True
+    return False
 
 
 STEPPER_OPERATORS = (
@@ -1097,8 +1211,10 @@ def apply_world(context):
 
 class MV_OT_AddStepFile(Operator, ImportHelper):
     bl_idname = "mv.add_step_file"
-    bl_label = "Add STEP File"
-    filter_glob: StringProperty(default="*.step;*.stp;*.STEP;*.STP", options={'HIDDEN'})
+    bl_label = "Add CAD File"
+    filter_glob: StringProperty(
+        default="*.step;*.stp;*.STEP;*.STP;*.stl;*.STL", options={'HIDDEN'},
+    )
     files: CollectionProperty(type=bpy.types.OperatorFileListElement)
     directory: StringProperty(subtype='DIR_PATH')
 
@@ -1138,7 +1254,11 @@ class MV_OT_ClearStepFiles(Operator):
 
 
 class MV_OT_ImportAllSteps(Operator):
-    """Import every STEP file in the list, one at a time.
+    """Import every file in the list, one at a time.
+
+    STEP files are converted first, by STEPper or by FreeCAD. STL files are
+    meshes already, so they skip both and go straight through Blender's own
+    importer; from the product collection onwards the two are indistinguishable.
 
     Runs modally: the conversion subprocess is polled between timer ticks
     instead of being waited on, so Blender keeps redrawing, the status bar
@@ -1146,13 +1266,13 @@ class MV_OT_ImportAllSteps(Operator):
     falls back to running straight through.
     """
     bl_idname = "mv.import_all_steps"
-    bl_label = "Import STEP Files"
+    bl_label = "Import CAD Files"
     bl_options = {'REGISTER', 'UNDO'}
 
     def _setup(self, context):
         s = context.scene.mv_settings
         if not s.step_files:
-            self.report({'ERROR'}, "No STEP files in the list.")
+            self.report({'ERROR'}, "No files in the list.")
             return False
         self._prefs = context.preferences.addons[__name__].preferences
         self._queue = [bpy.path.abspath(item.path) for item in s.step_files]
@@ -1174,8 +1294,21 @@ class MV_OT_ImportAllSteps(Operator):
         self._problems.append(f"{os.path.basename(path)}: {reason}")
         self._done += 1
 
+    def _discard(self, objs):
+        """Throw away what a rejected import left in the scene.
+
+        The objects were never linked into a product collection, so without
+        this an empty mesh from a bad file would sit loose in the scene
+        collection with the file's name on it, looking like it had worked.
+        """
+        for obj in objs:
+            try:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            except (ReferenceError, RuntimeError):
+                pass
+
     def _link_new(self, context, path, new_objs):
-        # Always a fresh collection. Looking the name up first meant two STEP
+        # Always a fresh collection. Looking the name up first meant two
         # files sharing a basename -- partA/housing.step and partB/housing.step
         # -- landed in one collection and rendered as a single product, and an
         # unrelated collection that happened to be called "housing" would have
@@ -1208,13 +1341,30 @@ class MV_OT_ImportAllSteps(Operator):
             self._fail(path, "file not found")
             return
         self._before = set(bpy.data.objects)
+
+        if is_stl(path):
+            # Nothing to convert, so no importer preference applies and no
+            # subprocess is started: the file lands now and _advance moves on
+            # to the next one on the same tick.
+            if not import_stl_file(path):
+                self._fail(path, "STL import failed")
+                return
+            new = self._new_objects()
+            if has_geometry(new):
+                self._link_new(context, path, new)
+            else:
+                self._discard(new)
+                self._fail(path, "STL contained no geometry")
+            return
+
         mode = self._prefs.step_import_mode
 
         if mode in {'AUTO', 'STEPPER'} and try_stepper_import(path):
             new = self._new_objects()
-            if new:
+            if has_geometry(new):
                 self._link_new(context, path, new)
                 return
+            self._discard(new)
             if mode == 'STEPPER':
                 self._fail(path, "STEPper reported success but added no geometry")
                 return
@@ -1238,9 +1388,10 @@ class MV_OT_ImportAllSteps(Operator):
         obj_path, log = freecad_collect(job)
         if obj_path and import_obj_file(obj_path):
             new = self._new_objects()
-            if new:
+            if has_geometry(new):
                 self._link_new(context, path, new)
             else:
+                self._discard(new)
                 self._fail(path, "converted mesh contained no geometry")
         else:
             tail = " ".join(log.split())[-160:]
@@ -1814,6 +1965,7 @@ class MV_PT_Import(Panel):
         col = box.column()
         col.enabled = prefs.step_import_mode in {'AUTO', 'FREECAD'}
         col.prop(prefs, "freecad_path", text="FreeCAD")
+        box.label(text="STL files ignore this and import directly.", icon='INFO')
 
         layout.separator()
         row = layout.row()
@@ -1850,7 +2002,7 @@ class MV_PT_Standardize(Panel):
         s = context.scene.mv_settings
 
         layout.prop(s, "fit_on_import")
-        layout.label(text="Runs as each STEP file lands.", icon='INFO')
+        layout.label(text="Runs as each file lands.", icon='INFO')
 
         layout.separator()
         row = layout.row(align=True)
@@ -1947,6 +2099,20 @@ class MV_PT_Render(Panel):
             last = product_label(s.start_prefix, s.start_number, len(prods) - 1, s.products_per_letter)
             box.label(text=f"First: {first}_{prods[0].name}", icon='FILE')
             box.label(text=f"Last:  {last}_{prods[-1].name}", icon='FILE')
+
+        strays = stray_render_objects(context)
+        if strays:
+            box = layout.box()
+            box.label(text=f"{len(strays)} object(s) outside {PRODUCT_COLL}", icon='ERROR')
+            box.label(text="appear in every render:")
+            col = box.column(align=True)
+            for obj in strays[:4]:
+                col.label(text=obj.name, icon='OBJECT_DATA')
+            if len(strays) > 4:
+                col.label(text=f"+{len(strays) - 4} more")
+            box.label(text="Delete them, move them into a")
+            box.label(text="product, or switch off their")
+            box.label(text="render visibility (camera icon).")
 
         layout.operator("mv.render_all", icon='RENDER_STILL')
 
