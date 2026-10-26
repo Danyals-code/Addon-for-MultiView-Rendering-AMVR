@@ -1,0 +1,45 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      # The version the suite is written against. Bump deliberately: Blender
+      # changes its Python API between releases.
+      BLENDER_VERSION: "5.0.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Blender
+        id: cache-blender
+        uses: actions/cache@v4
+        with:
+          path: blender
+          key: blender-${{ env.BLENDER_VERSION }}-linux-x64
+
+      - name: Download Blender
+        if: steps.cache-blender.outputs.cache-hit != 'true'
+        run: |
+          series="${BLENDER_VERSION%.*}"
+          curl -fsSL -o blender.tar.xz \
+            "https://download.blender.org/release/Blender${series}/blender-${BLENDER_VERSION}-linux-x64.tar.xz"
+          mkdir blender
+          tar -xf blender.tar.xz -C blender --strip-components=1
+
+      - name: Install system libraries
+        # Blender's Workbench and Cycles renders run headless through EGL;
+        # Mesa supplies a software GL on a runner without a GPU.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libglx-mesa0 libgl1-mesa-dri libxi6 libxxf86vm1 \
+            libxfixes3 libxrender1 libxkbcommon0 libsm6 libice6
+
+      - name: Run tests
+        run: python3 tests/run_tests.py --blender blender/blender
