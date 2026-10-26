@@ -8,7 +8,7 @@ every view in one click, with predictable file names like `AA_01_Widget_Front_cl
 
 - **Blender:** 4.0 and newer
 - **Panel location:** `3D Viewport → Sidebar (N key) → MultiView`
-- **Version:** 1.9.0
+- **Version:** 1.10.0
 
 ---
 
@@ -605,6 +605,116 @@ since been deleted are dropped.
 
 ---
 
+#### Annotations for research
+
+The **Annotations** section under Batch Render turns a render into a dataset. Everything
+here is computed from the same fixed camera rig as the images, so it lines up with them to
+the pixel. The test suite checks the camera numbers against Blender's own projection and the
+depth against ray casts.
+
+| Setting | Writes | Notes |
+| --- | --- | --- |
+| **Cameras** (on by default) | `AA_01_Widget_cameras.json`, `AA_01_Widget_transforms.json`, and `..._Turntable_..._transforms.json` | See below |
+| **Depth** | `..._Front_depth.exr` | 32-bit EXR, distance along the view axis in scene units, 0 and alpha 0 off the product |
+| **Normals** | `..._Front_normal.exr` | 32-bit EXR, camera space, OpenGL axes (+X right, +Y up, +Z towards the camera), values -1..1 |
+| **Part IDs** | `..._Front_parts.png` | 16-bit greyscale PNG: 0 is background, *n* is the *n*-th part in `cameras.json`'s `parts` list. Parts are the product's objects, so a STEP assembly's parts keep the names its CAD file gave them |
+| **COCO** | `coco.json` | One instance mask (uncompressed RLE) per visible part per image, with `part_id` and `part_name`. Categories are products. Turns on Part IDs |
+| **BOP** | `bop/` | A [BOP](https://github.com/thodan/bop_toolkit/blob/master/docs/bop_datasets_format.md) dataset from the perspective views: `train_pbr/<scene>/rgb`, `depth` (uint16, mm), `mask`, `mask_visib`, `scene_camera.json`, `scene_gt.json`, `scene_gt_info.json`, plus `models/obj_*.ply` and `models_info.json`. Turns on Depth |
+
+Depth, Normals and Part IDs are each one extra Cycles render per view: one sample, no
+antialiasing filter, every surface replaced by an emitter that outputs the number itself.
+Each pixel therefore belongs to exactly one surface. There is no blending of a part's ID with
+the background, or of a foreground depth with what is behind it. They need the Cycles add-on
+(on by default) whatever engine the Full render uses. They are never post-processed or put
+on a contact sheet.
+
+**`cameras.json`** describes every view of the product:
+
+- `c2w_opengl`: camera-to-world matrix, Blender/OpenGL axes (looking down -Z, +Y up).
+- `w2c_opencv`: world-to-camera matrix, OpenCV axes (looking down +Z, +Y down), as COLMAP
+  and BOP use.
+- `K` for perspective views. Orthographic views get `pixel_size` and `principal_point`
+  instead, since no K describes them.
+- `width`, `height`, `clip`, and the relative paths of every image of that view.
+- `model_to_world`: the 4x4 matrix from the product's **source file coordinates** (in
+  `source_units`) to the scene. MultiView records every move it makes to a product (fitting,
+  recentring, turning, Auto Orient), so a pixel in any render can be traced back to a point
+  in the original CAD file. Moves you make by hand in the viewport are not seen.
+
+**`transforms.json`** is in the nerfstudio/Instant-NGP format, for NeRF and Gaussian
+splatting tools. It lists the perspective views only, with per-frame intrinsics and
+`mask_path` when the Mask pass is on. A turntable gets its own `transforms.json`: the
+product turns and the camera stays still, so each frame is given the camera that would
+circle a still product. That is what those tools expect.
+
+BOP wants rigid poses in millimetres of the model, although the scene was scaled to fit.
+The scale is taken back out of the camera translation, the model is exported in its own
+source units converted to mm, and depth is written in the same mm, with a `depth_scale` per
+image so large parts still fit in 16 bits. Only perspective views go into BOP, because the
+format has no orthographic camera.
+
+## Command line
+
+Everything the panels do can run without Blender's window, from a job file:
+
+```bash
+blender -b --factory-startup --python multiview_product_renderer/cli.py -- --config job.json
+```
+
+The add-on does not need to be installed for this: `cli.py` loads it from the folder it sits
+in. A job is JSON or TOML, and relative paths in it are relative to the job file:
+
+```json
+{
+  "inputs": ["parts/", "extra/housing.step"],
+  "recursive": true,
+  "output": "renders/",
+  "freecad": "C:/Program Files/FreeCAD 1.1/bin/freecadcmd.exe",
+  "step_import_mode": "FREECAD",
+  "standardize": false,
+  "auto_orient": "FLAT",
+  "scene_setup": true,
+  "settings": {
+    "render_mode": "CLAY",
+    "view_set": "ALL",
+    "pass_depth": true,
+    "export_coco": true,
+    "turntable_elevation": 20
+  },
+  "render": {"engine": "CYCLES", "samples": 64, "device": "CPU",
+             "resolution": [1024, 1024], "file_format": "PNG"},
+  "save_blend": "renders/job.blend"
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `blend` | Start from this `.blend` instead of an empty scene. With no `inputs`, its existing products are rendered |
+| `inputs`, `recursive` | Files and folders to import (folders expanded, sorted) |
+| `output` | Output folder; `--output` overrides it |
+| `freecad`, `step_import_mode`, `deflection` | STEP/IGES conversion, as in the add-on preferences |
+| `standardize`, `auto_orient` | Run Standardize Products / Auto Orient (true, `"FLAT"` or `"PCA"`) on everything after import |
+| `scene_setup` | Apply Scene Setup (lighting, background, ground). Default true |
+| `settings` | Any panel setting by name; `--list-settings` prints them all with their types. Angles are in degrees |
+| `render` | `engine`, `samples`, `device`, `resolution`, `percentage`, `file_format` |
+| `save_blend` | Save the set-up scene afterwards, to open and inspect in Blender |
+
+Other modes:
+
+- `--check` imports and sets up, runs the pre-flight check, prints its findings and renders
+  nothing.
+- `--shard 2/8` imports and renders only every eighth file, starting with the third. Labels
+  still count through the whole job, so eight shards started at once, on one machine or
+  eight, write exactly the files one run would. Each writes its own
+  `manifest_shard02.json`, `coco_shard02.json` and BOP `models_info_shard02.json`.
+- `--merge renders/` then combines those into `manifest.json`/`.csv`, `coco.json` and
+  `models_info.json`.
+- `--list-settings` prints every setting `settings` accepts.
+
+It prints a `MULTIVIEW_SUMMARY {...}` JSON line at the end. The exit code is 0 when
+everything rendered, 1 when some images failed, and 2 when the job could not run: a bad job
+file, nothing imported, or pre-flight errors.
+
 ## Collections the add-on creates
 
 | Collection | Contents |
@@ -669,6 +779,24 @@ again.
 (try `0.02`) and re-import.
 
 ---
+
+## Tests
+
+The `tests/` folder holds the test suite: each `test_*.py` runs inside a background Blender
+and checks the add-on end to end, by rendering real images and reading them back.
+
+```bash
+python tests/run_tests.py --blender "C:/Program Files/Blender Foundation/Blender 5.0/blender.exe"
+```
+
+Any Python 3 runs the runner, including Blender's own (`<Blender>/5.0/python/bin/python`).
+FreeCAD is optional: with `freecadcmd` on `PATH`, or `FREECAD_CMD` set, the STEP and IGES
+import checks run too; without it they are skipped (`FREECAD_CMD=none` forces that). GitHub
+Actions runs the suite on every push against Blender 5.0.0 (`.github/workflows/tests.yml`),
+without FreeCAD.
+
+The suite is written against **Blender 5.0**. The add-on aims to support 4.0 and newer, but
+only 5.0 is tested.
 
 ## License
 

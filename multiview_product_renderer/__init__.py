@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MultiView Product Renderer",
     "author": "Danyal Sarfraz",
-    "version": (1, 9, 0),
+    "version": (1, 10, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > MultiView",
     "description": "Import CAD and mesh files, set up cameras and studio lighting, batch render products across views.",
@@ -154,6 +154,11 @@ GUIDE_LINES = [
     "   or however the Naming templates say.",
     "   Optional extras under Batch Render: contact sheets, turntables",
     "   (MP4/GIF), post-processed copies, and a CSV/JSON manifest.",
+    "   Annotations adds cameras.json/transforms.json, depth, normals,",
+    "   part IDs, COCO and BOP for building datasets.",
+    "",
+    "Headless: blender -b --python multiview_product_renderer/cli.py",
+    "  -- --config job.json   (see README, Command line)",
     "   Only products are hidden between shots, so anything outside",
     "   MV_Products lands in every image. The panel warns you first.",
     "",
@@ -194,6 +199,26 @@ class MV_AddonPreferences(AddonPreferences):
         layout.prop(self, "step_import_mode")
         layout.prop(self, "freecad_path")
         layout.prop(self, "tessellation_deflection")
+
+
+# Set by the command line, which can run the add-on straight from its folder
+# without it being installed, and so without add-on preferences to read.
+PREFS_OVERRIDE = None
+
+
+def addon_prefs(context):
+    if PREFS_OVERRIDE is not None:
+        return PREFS_OVERRIDE
+    addon = context.preferences.addons.get(__name__)
+    if addon is not None:
+        return addon.preferences
+    from types import SimpleNamespace
+    return SimpleNamespace(step_import_mode='AUTO', freecad_path="",
+                           tessellation_deflection=0.1)
+
+
+# What the last Render All did, for the command line's summary and exit code.
+LAST_RENDER = {}
 
 
 class MV_StepFileItem(PropertyGroup):
@@ -473,6 +498,50 @@ class MV_Settings(PropertyGroup):
                ('CLAY', "Clay", "Lines drawn over the clay render"),
                ('NONE', "None", "Lines only, on transparency")],
         default='WHITE',
+    )
+    pass_depth: BoolProperty(
+        name="Depth",
+        description="Write a depth map per view: 32-bit EXR, distance along the view "
+                    "axis in scene units. Needs Cycles. Mode 'depth'",
+        default=False,
+    )
+    pass_normal: BoolProperty(
+        name="Normals",
+        description="Write a camera-space normal map per view: 32-bit EXR, OpenGL axes. "
+                    "Needs Cycles. Mode 'normal'",
+        default=False,
+    )
+    pass_parts: BoolProperty(
+        name="Part IDs",
+        description="Write a 16-bit PNG per view saying which part each pixel shows: 0 is "
+                    "background, the rest number the parts as listed in cameras.json. "
+                    "Needs Cycles. Mode 'parts'",
+        default=False,
+    )
+    export_cameras: BoolProperty(
+        name="Cameras",
+        description="Write each product's camera intrinsics and poses (cameras.json) and "
+                    "a nerfstudio-style transforms.json for its perspective views and "
+                    "turntable",
+        default=True,
+    )
+    export_coco: BoolProperty(
+        name="COCO",
+        description="Write coco.json with one instance mask per visible part per image. "
+                    "Turns on Part IDs",
+        default=False,
+    )
+    export_bop: BoolProperty(
+        name="BOP",
+        description="Write a BOP-format dataset (bop/) from the perspective views: RGB, "
+                    "depth in mm, masks, object poses and models. Turns on Depth",
+        default=False,
+    )
+    shard_suffix: StringProperty(
+        description="Added to manifest, COCO and BOP model-info file names by the "
+                    "command line, so shards rendered in parallel do not overwrite "
+                    "each other's lists",
+        default="", options={'HIDDEN'},
     )
     ao_samples: IntProperty(name="AO Samples", default=32, min=1, max=4096)
     ao_distance: FloatProperty(
@@ -918,6 +987,32 @@ def collection_roots(coll):
     return [o for o in members if o.parent is None or o.parent not in members]
 
 
+IDENTITY_16 = tuple(float(i % 5 == 0) for i in range(16))
+
+
+def product_to_world(coll):
+    """Matrix taking the product's source coordinates (as imported, in its
+    source units) to where it sits in the scene now."""
+    m = coll.mv_to_world
+    return Matrix([m[i * 4:i * 4 + 4] for i in range(4)])
+
+
+def move_product(coll, xform):
+    """Apply a world-space transform to a whole product, and fold it into the
+    product's source-to-world record.
+
+    Every move MultiView makes goes through here -- fitting, recentring,
+    turning, auto-orienting -- so the record stays exact, and a pixel in any
+    render can be traced back to a point in the original CAD file. Baking does
+    not move geometry, so it needs no entry. Moves made by hand in the
+    viewport are not seen.
+    """
+    for obj in collection_roots(coll):
+        obj.matrix_world = xform @ obj.matrix_world
+    total = xform @ product_to_world(coll)
+    coll.mv_to_world = [v for row in total for v in row]
+
+
 def fit_collection(coll, target_size=None, recenter=True, floor=False):
     """Uniformly scale a product so its bounding box fits inside a cube of
     target_size, and optionally move that box onto the world origin.
@@ -951,8 +1046,7 @@ def fit_collection(coll, target_size=None, recenter=True, floor=False):
     xform = (Matrix.Translation(dest)
              @ Matrix.Scale(factor, 4)
              @ Matrix.Translation(-center))
-    for obj in collection_roots(coll):
-        obj.matrix_world = xform @ obj.matrix_world
+    move_product(coll, xform)
     return True
 
 
@@ -1046,8 +1140,7 @@ def turn_product(coll, rotation):
         return False
     center, _ = bbox_of(objs)
     xform = (Matrix.Translation(center) @ rotation.to_4x4() @ Matrix.Translation(-center))
-    for obj in collection_roots(coll):
-        obj.matrix_world = xform @ obj.matrix_world
+    move_product(coll, xform)
     return True
 
 
@@ -1426,8 +1519,7 @@ def rotate_product(context, coll, direction, step):
     xform = (Matrix.Translation(center)
              @ Matrix.Rotation(angle, 4, axis)
              @ Matrix.Translation(-center))
-    for obj in collection_roots(coll):
-        obj.matrix_world = xform @ obj.matrix_world
+    move_product(coll, xform)
     return True
 
 
@@ -1449,6 +1541,13 @@ def alpha_pair_to_idx(prefix):
     if not prefix:
         return 0
     return max(0, ord(prefix[0]) - ord('A'))
+
+
+def label_index(position, coll):
+    """Where a product's label is counted from: its own recorded index when
+    the command line has set one, otherwise its place in MV_Products."""
+    fixed = getattr(coll, "mv_label_index", -1)
+    return fixed if fixed >= 0 else position
 
 
 def product_label(start_prefix, start_number, offset, per_letter):
@@ -2826,7 +2925,7 @@ class MV_OT_ImportAllSteps(Operator):
         if not s.step_files:
             self.report({'ERROR'}, "No files in the list.")
             return False
-        self._prefs = context.preferences.addons[__name__].preferences
+        self._prefs = addon_prefs(context)
         self._queue = [bpy.path.abspath(item.path) for item in s.step_files]
         self._total = len(self._queue)
         self._done = 0
@@ -3713,6 +3812,259 @@ def _do_ao_render(scene, filepath, options):
         bpy.ops.render.render(write_still=True)
 
 
+# -- data passes ------------------------------------------------------------
+#
+# Depth, normals and part IDs are measurements, not pictures. Each is a Cycles
+# render of one sample with every surface swapped for an emitter that outputs
+# the number wanted, written as 32-bit EXR so nothing is colour managed,
+# clamped or quantized. One sample with a near-zero pixel filter puts every
+# pixel on exactly one surface: no antialiasing to average a foreground depth
+# with the background, or blend two part IDs into a third that does not exist.
+
+def write_png16(path, values):
+    """Write a 2D array of 0-65535 as a 16-bit greyscale PNG, top row first.
+
+    Blender's image API saves 8 bits from Python, which caps a label map at
+    255 parts and a depth map at 255 steps, so this writes the file directly.
+    """
+    values = np.ascontiguousarray(np.clip(values, 0, 65535).astype(">u2"))
+    h, w = values.shape
+    rows = b"".join(b"\x00" + values[y].tobytes() for y in range(h))
+
+    def chunk(kind, data):
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+        f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 16, 0, 0, 0, 0)))
+        f.write(chunk(b"IDAT", zlib.compress(rows, 6)))
+        f.write(chunk(b"IEND", b""))
+
+
+def read_png16(path):
+    """Read back a 16-bit greyscale PNG written by write_png16."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG")
+    pos, idat, w, h = 8, b"", 0, 0
+    while pos < len(data):
+        length, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        body = data[pos + 8:pos + 8 + length]
+        if kind == b"IHDR":
+            w, h, depth, colour = struct.unpack(">IIBB", body[:10])
+            if depth != 16 or colour != 0:
+                raise ValueError("not a 16-bit greyscale PNG")
+        elif kind == b"IDAT":
+            idat += body
+        pos += 12 + length
+    raw = np.frombuffer(zlib.decompress(idat), dtype=np.uint8).reshape(h, 1 + w * 2)
+    if raw[:, 0].any():
+        raise ValueError("row filters other than None are not supported")
+    return raw[:, 1:].copy().view(">u2").astype(np.uint16)
+
+
+def _black_world():
+    world = bpy.data.worlds.get("MV_Data_World") or bpy.data.worlds.new("MV_Data_World")
+    tree = node_tree_of(world)
+    tree.nodes.clear()
+    bg = tree.nodes.new("ShaderNodeBackground")
+    bg.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+    bg.inputs["Strength"].default_value = 0.0
+    out = tree.nodes.new("ShaderNodeOutputWorld")
+    tree.links.new(bg.outputs["Background"], out.inputs["Surface"])
+    return world
+
+
+def _data_material(kind):
+    """An emitter whose colour is the measurement itself."""
+    name = f"MV_Data_{kind}"
+    mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+    tree = node_tree_of(mat)
+    tree.nodes.clear()
+    emit = tree.nodes.new("ShaderNodeEmission")
+    emit.inputs["Strength"].default_value = 1.0
+    out = tree.nodes.new("ShaderNodeOutputMaterial")
+    out.location = (400, 0)
+    tree.links.new(emit.outputs["Emission"], out.inputs["Surface"])
+    if kind == "depth":
+        cam = tree.nodes.new("ShaderNodeCameraData")
+        cam.location = (-300, 0)
+        tree.links.new(cam.outputs["View Z Depth"], emit.inputs["Color"])
+    elif kind == "normal":
+        # World space here; _do_normal_render turns it into camera space with
+        # the camera's own matrix. Cycles' "camera space" points Z the other
+        # way from OpenGL, so relying on it would flip every normal.
+        geo = tree.nodes.new("ShaderNodeNewGeometry")
+        geo.location = (-300, 0)
+        tree.links.new(geo.outputs["Normal"], emit.inputs["Color"])
+    else:
+        info = tree.nodes.new("ShaderNodeObjectInfo")
+        info.location = (-300, 0)
+        tree.links.new(info.outputs["Object Index"], emit.inputs["Color"])
+    return mat
+
+
+def _render_data(scene, filepath, kind, extra=()):
+    if not hasattr(scene, "cycles"):
+        raise RuntimeError(f"the {kind} pass needs the Cycles add-on enabled")
+    image = scene.render.image_settings
+    with temporarily(
+            (scene.render, "engine", 'CYCLES'),
+            (scene.cycles, "samples", 1),
+            (scene.cycles, "use_denoising", False),
+            (scene.cycles, "use_adaptive_sampling", False),
+            (scene.cycles, "filter_width", 0.01),
+            (scene.render, "use_motion_blur", False),
+            (scene.render, "film_transparent", True),
+            (scene.render, "use_file_extension", True),
+            (bpy.context.view_layer, "material_override", _data_material(kind)),
+            (scene, "world", _black_world()),
+            (image, "file_format", 'OPEN_EXR'),
+            (image, "color_mode", 'RGBA'),
+            (image, "color_depth", '32'),
+            *_neutral_view(scene),
+            *extra):
+        scene.render.filepath = filepath
+        bpy.ops.render.render(write_still=True)
+    return filepath + ".exr"
+
+
+def _do_depth_render(scene, filepath):
+    """Distance along the camera's view axis, in scene units, in R, G and B;
+    0 and alpha 0 where nothing was hit."""
+    _render_data(scene, filepath, "depth")
+
+
+def save_exr(px, path):
+    """Write float RGBA pixels (rows bottom to top) to a 32-bit EXR as is."""
+    h, w = px.shape[:2]
+    img = bpy.data.images.new("MV_Data", w, h, alpha=True, float_buffer=True)
+    try:
+        img.pixels.foreach_set(np.ascontiguousarray(px, dtype=np.float32).ravel())
+        img.filepath_raw = path
+        img.file_format = 'OPEN_EXR'
+        img.save()
+    finally:
+        bpy.data.images.remove(img)
+
+
+def _do_normal_render(scene, filepath):
+    """Shading normals in camera space, OpenGL convention: +X right, +Y up,
+    +Z towards the camera. Values in -1..1, not remapped."""
+    work = tempfile.mkdtemp(prefix="mv_normal_")
+    try:
+        px = load_pixels(_render_data(scene, os.path.join(work, "world"), "normal"), raw=True)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    to_cam = np.array(scene.camera.matrix_world.to_3x3().normalized().transposed())
+    hit = px[..., 3] > 0.5
+    px[..., :3] = np.where(hit[..., None], px[..., :3] @ to_cam.T, 0.0)
+    save_exr(px, filepath + ".exr")
+    scene.render.filepath = filepath
+
+
+def _do_parts_render(scene, filepath, part_map):
+    """Which part every pixel shows, as a 16-bit PNG: 0 is background, n is
+    the n-th part in the product's part list. Returns the label array.
+
+    Part numbers go in through each object's pass index, set only for the
+    render and put back afterwards.
+    """
+    extra = []
+    for name, part_id in part_map.items():
+        obj = bpy.data.objects.get(name)
+        if obj is not None:
+            extra.append((obj, "pass_index", part_id))
+    work = tempfile.mkdtemp(prefix="mv_parts_")
+    try:
+        exr = _render_data(scene, os.path.join(work, "ids"), "ids", extra)
+        px = load_pixels(exr, raw=True)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    labels = np.where(px[..., 3] > 0.5, np.rint(px[..., 0]), 0).astype(np.int64)
+    labels = np.clip(labels, 0, 65535)[::-1]
+    write_png16(filepath + ".png", labels)
+    scene.render.filepath = filepath
+    return labels
+
+
+# (name, render function, file extension). Unlike the image modes these are
+# never post-processed or put on a contact sheet: they are data.
+def data_modes(settings):
+    s = settings
+    modes = []
+    if s.pass_depth or s.export_bop:
+        modes.append(("depth", _do_depth_render, ".exr"))
+    if s.pass_normal:
+        modes.append(("normal", _do_normal_render, ".exr"))
+    if s.pass_parts or s.export_coco:
+        modes.append(("parts", _do_parts_render, ".png"))
+    return modes
+
+
+def part_list(coll):
+    """The product's parts, numbered from 1 in name order, as written into
+    the part-ID images and cameras.json."""
+    meshes = sorted((o for o in collection_meshes(coll) if o.type == 'MESH'),
+                    key=lambda o: o.name)
+    return {o.name: i + 1 for i, o in enumerate(meshes)}
+
+
+# -- cameras --------------------------------------------------------------------
+
+def render_resolution(scene):
+    r = scene.render
+    return (int(r.resolution_x * r.resolution_percentage / 100),
+            int(r.resolution_y * r.resolution_percentage / 100))
+
+
+def camera_record(scene, cam):
+    """Everything needed to project the scene into one of this camera's images.
+
+    Extrinsics come in both conventions in use: camera-to-world in OpenGL axes
+    (Blender's own, and nerfstudio's: +Y up, looking down -Z) and
+    world-to-camera in OpenCV axes (+Y down, looking down +Z; COLMAP and BOP).
+    Perspective cameras get a pinhole K. Orthographic ones get the size of a
+    pixel in scene units instead, since no K describes them.
+    """
+    r = scene.render
+    w, h = render_resolution(scene)
+    data = cam.data
+    c2w = cam.matrix_world.normalized()
+    flip = Matrix(((1, 0, 0, 0), (0, -1, 0, 0), (0, 0, -1, 0), (0, 0, 0, 1)))
+    w2c_cv = flip @ c2w.inverted()
+    pax, pay = r.pixel_aspect_x, r.pixel_aspect_y
+    fit = data.sensor_fit
+    if fit == 'AUTO':
+        fit = 'HORIZONTAL' if w * pax >= h * pay else 'VERTICAL'
+    aspect = pay / pax
+    across = w if fit == 'HORIZONTAL' else h * aspect
+    record = {
+        "camera": cam.name,
+        "width": w, "height": h,
+        "c2w_opengl": [list(row) for row in c2w],
+        "w2c_opencv": [list(row) for row in w2c_cv],
+    }
+    if data.type == 'ORTHO':
+        size = data.ortho_scale / across
+        record.update(projection="orthographic", ortho_scale=data.ortho_scale,
+                      pixel_size=[size, size * aspect],
+                      principal_point=[w / 2 - data.shift_x * across,
+                                       h / 2 + data.shift_y * across / aspect])
+    else:
+        sensor = data.sensor_height if fit == 'VERTICAL' else data.sensor_width
+        fx = data.lens / sensor * across
+        fy = fx / aspect
+        cx = w / 2 - data.shift_x * across
+        cy = h / 2 + data.shift_y * across / aspect
+        record.update(projection="perspective", lens_mm=data.lens,
+                      K=[[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
+    record["clip"] = [data.clip_start, data.clip_end]
+    return record
+
+
 def written_path(scene, path):
     """Where render.render(write_still=True) puts an image asked for at path.
 
@@ -3829,7 +4181,9 @@ def srgb_encode(rgb):
     return np.where(rgb <= 0.0031308, rgb * 12.92, 1.055 * np.power(rgb, 1 / 2.4) - 0.055)
 
 
-def load_pixels(path):
+def load_pixels(path, raw=False):
+    """RGBA pixels of an image file. raw keeps float data exactly as stored,
+    for depth, normal and ID passes where the numbers are measurements."""
     img = bpy.data.images.load(path, check_existing=False)
     try:
         w, h = img.size
@@ -3838,6 +4192,8 @@ def load_pixels(path):
         px = np.empty(w * h * 4, dtype=np.float32)
         img.pixels.foreach_get(px)
         px = px.reshape(h, w, 4)
+        if raw:
+            return px
         if img.is_float:
             # 16-bit PNG and EXR come in as scene-linear floats. Encode them
             # back to display values so they sit with everything else; EXR
@@ -4322,13 +4678,14 @@ def encode_gif(frames, out_path, fps, max_size, background):
 
 # -- manifest -----------------------------------------------------------------
 
+MEASURABLE_IMAGES = {".png", ".jpg", ".jpeg", ".webp", ".exr", ".tif", ".tiff", ".bmp"}
 MANIFEST_FIELDS = ("label", "product", "kind", "view", "mode", "path",
                    "width", "height", "source_file", "source_size", "source_units")
 
 
-def read_manifest(out_root):
-    json_path = os.path.join(out_root, "manifest.json")
-    csv_path = os.path.join(out_root, "manifest.csv")
+def read_manifest(out_root, name="manifest"):
+    json_path = os.path.join(out_root, name + ".json")
+    csv_path = os.path.join(out_root, name + ".csv")
     try:
         if os.path.isfile(json_path):
             with open(json_path, encoding="utf-8") as f:
@@ -4341,19 +4698,19 @@ def read_manifest(out_root):
     return []
 
 
-def write_manifest(out_root, records, labels, fmt):
+def write_manifest(out_root, records, labels, fmt, name="manifest"):
     """Merge this run's outputs into manifest.json / manifest.csv.
 
     Rows for products this run did not touch are carried over, so rendering
     one product does not wipe the rest of the batch from the list. Rows for
     files that are no longer on disk are dropped.
     """
-    rows = [r for r in read_manifest(out_root) if r.get("label") not in labels]
+    rows = [r for r in read_manifest(out_root, name) if r.get("label") not in labels]
     for rec in records:
         if not file_ok(rec["path"]):
             continue
         width, height = rec.get("width"), rec.get("height")
-        if width is None and not rec["path"].lower().endswith((".mp4", ".gif")):
+        if width is None and file_ext(rec["path"]) in MEASURABLE_IMAGES:
             width, height = image_size(rec["path"])
         row = {k: rec.get(k) for k in MANIFEST_FIELDS}
         row.update(path=os.path.relpath(rec["path"], out_root).replace("\\", "/"),
@@ -4363,11 +4720,11 @@ def write_manifest(out_root, records, labels, fmt):
     rows.sort(key=lambda r: (str(r.get("label")), str(r.get("kind")), str(r.get("path"))))
 
     if fmt in {'JSON', 'BOTH'}:
-        with open(os.path.join(out_root, "manifest.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(out_root, name + ".json"), "w", encoding="utf-8") as f:
             json.dump({"generated": datetime.now().isoformat(timespec="seconds"),
                        "images": rows}, f, indent=2)
     if fmt in {'CSV', 'BOTH'}:
-        with open(os.path.join(out_root, "manifest.csv"), "w", encoding="utf-8", newline="") as f:
+        with open(os.path.join(out_root, name + ".csv"), "w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS, extrasaction='ignore')
             writer.writeheader()
             for row in rows:
@@ -4520,9 +4877,9 @@ def preflight(context, only_active=False):
         return issues
     if only_active:
         coll, idx = active_product(context)
-        targets = [(idx, coll)]
+        targets = [(label_index(idx, coll), coll)]
     else:
-        targets = [(i, pc) for i, pc in enumerate(products) if pc.mv_render]
+        targets = [(label_index(i, pc), pc) for i, pc in enumerate(products) if pc.mv_render]
         if not targets:
             _issue(issues, 'ERROR', "No products are ticked for rendering")
             return issues
@@ -4569,12 +4926,22 @@ def preflight(context, only_active=False):
               getattr(bpy.data.collections.get(CAMERA_COLL), "objects", [])
               if o.type == 'CAMERA'])
     if _names_clash(s, targets, views + (["Sheet"] if s.sheet_enabled else []),
-                    [m for m, _, _ in render_modes(s)]):
+                    [m for m, _, _ in render_modes(s)] + [m for m, _, _ in data_modes(s)]):
         _issue(issues, 'ERROR', "Template gives two images one name")
 
     # Engine-specific passes and staging.
     if s.pass_ao and not hasattr(scene, "cycles"):
         _issue(issues, 'ERROR', "AO pass needs the Cycles add-on")
+    if data_modes(s) and not hasattr(scene, "cycles"):
+        _issue(issues, 'ERROR', "Depth/normal/part passes need Cycles")
+    if s.export_bop:
+        if s.reframe_on_render:
+            persp = [v for v in planned_views(s) if v[1] == "persp"]
+        else:
+            persp = [o for o in getattr(bpy.data.collections.get(CAMERA_COLL), "objects", [])
+                     if o.type == 'CAMERA' and o.data.type == 'PERSP']
+        if not persp:
+            _issue(issues, 'WARNING', "BOP uses perspective views; none selected")
     full = any(fn is _do_full_render for _, fn, _ in render_modes(s)) or (
         s.turntable_enabled and s.turntable_style == 'FULL')
     if full and s.ground_mode == 'SHADOW' and scene.render.engine != 'CYCLES':
@@ -4875,6 +5242,8 @@ class MV_OT_RenderAll(Operator):
         s = scene.mv_settings
         root = self._out_root
         modes = render_modes(s)
+        data = data_modes(s)
+        coco_sources = []
 
         for idx, pc in targets:
             meta = self._meta(idx, pc)
@@ -4882,9 +5251,30 @@ class MV_OT_RenderAll(Operator):
             name = f"{meta['label']}_{pc.name}"
             first_job = len(self._queue)
             sheet_cells = {mode: [] for mode, _, _ in modes}
+            parts = part_list(pc)
+            views = []
 
             for cam in cameras:
                 view = cam.name.replace("MV_Cam_", "")
+                files = {}
+                views.append({"view": view, "camera": cam.name, "files": files})
+                for mode, render, ext in data:
+                    values = name_values(s, idx, pc.name, view, mode)
+                    path = os.path.join(root, output_folder(s, values), output_basename(s, values))
+                    self._claim(path)
+                    master = path + ext
+                    files[mode] = master
+                    rec = dict(meta, view=view, mode=mode)
+                    if s.skip_existing and file_ok(master):
+                        self._skipped += 1
+                        self._record(rec, "data", master, *self._render_size(scene))
+                        continue
+                    self._queue.append({
+                        "kind": "render", "product": pc.name, "status": f"{name} {view} {mode}",
+                        "camera": cam.name, "render": render, "path": path, "master": master,
+                        "post": [], "rec": rec, "record_as": "data",
+                        "extra": (parts,) if mode == "parts" else (),
+                    })
                 for mode, render, extra in modes:
                     values = name_values(s, idx, pc.name, view, mode)
                     rel_dir = output_folder(s, values)
@@ -4896,6 +5286,7 @@ class MV_OT_RenderAll(Operator):
                     for target, _ in post:
                         self._claim(target)
                     rec = dict(meta, view=view, mode=mode)
+                    files[mode] = master
                     sheet_cells[mode].append((view, post[0][0] if post else master))
 
                     have_master = s.skip_existing and file_ok(master)
@@ -4930,8 +5321,32 @@ class MV_OT_RenderAll(Operator):
                                         "path": path, "cells": cells, "title": title,
                                         "rec": rec})
 
+            if s.export_cameras:
+                paths = {}
+                for kind in ("cameras", "transforms"):
+                    values = name_values(s, idx, pc.name, kind, "")
+                    paths[kind] = os.path.join(root, output_folder(s, values),
+                                               output_basename(s, values) + ".json")
+                    self._claim(paths[kind])
+                self._queue.append({"kind": "cameras", "product": pc.name,
+                                    "status": f"{name} cameras", "path": paths["cameras"],
+                                    "transforms": paths["transforms"], "views": views,
+                                    "parts": parts, "rec": dict(meta, view="Cameras", mode="")})
+            if s.export_bop:
+                self._queue.append({"kind": "bop", "product": pc.name, "index": idx,
+                                    "status": f"{name} BOP", "path": os.path.join(root, "bop"),
+                                    "views": views, "rec": meta})
+            if s.export_coco:
+                coco_sources.append((idx, pc.name, meta, views, parts))
+
             if s.turntable_enabled:
                 self._plan_turntable(context, idx, pc, meta)
+
+        if coco_sources:
+            path = os.path.join(root, f"coco{s.shard_suffix}.json")
+            self._claim(path)
+            self._queue.append({"kind": "coco", "status": "COCO annotations", "path": path,
+                                "sources": coco_sources})
 
     def _plan_turntable(self, context, idx, pc, meta):
         scene = context.scene
@@ -4967,6 +5382,12 @@ class MV_OT_RenderAll(Operator):
             missing.append((k, path, master))
 
         self._skipped += n - len(missing)
+        if s.export_cameras:
+            path = os.path.join(root, rel_dir, "turntable", f"{base}_transforms.json")
+            self._claim(path)
+            self._queue.append({"kind": "turn_cameras", "product": pc.name,
+                                "status": f"{name} turntable cameras", "path": path,
+                                "frames": frames, "rec": dict(rec, view="Turntable cameras")})
         if s.skip_existing and not missing and all(file_ok(p) for _, p in outputs):
             for _, path in outputs:
                 self._record(rec, "turntable", path)
@@ -5022,12 +5443,12 @@ class MV_OT_RenderAll(Operator):
 
         if self.only_active:
             coll, idx = active_product(context)
-            targets = [(idx, coll)]
+            targets = [(label_index(idx, coll), coll)]
         else:
             # Index into the whole batch, not the ticked subset: the label is
             # the product's identity on disk, and unticking AA_02 must not turn
             # AA_03 into a second AA_02.
-            targets = [(i, pc) for i, pc in enumerate(products) if pc.mv_render]
+            targets = [(label_index(i, pc), pc) for i, pc in enumerate(products) if pc.mv_render]
             if not targets:
                 self.report({'ERROR'}, "No products are ticked for rendering.")
                 return {'CANCELLED'}
@@ -5101,9 +5522,10 @@ class MV_OT_RenderAll(Operator):
                                    "and {mode} to the file name template.")
             return {'CANCELLED'}
 
-        if any(job["kind"] == "turn_frame" for job in self._queue):
+        if any(job["kind"] in {"turn_frame", "turn_cameras"} for job in self._queue):
             if build_turntable_camera(context) is None:
-                self._queue = [j for j in self._queue if j["kind"] not in {"turn_frame", "turn_encode"}]
+                self._queue = [j for j in self._queue
+                               if j["kind"] not in {"turn_frame", "turn_encode", "turn_cameras"}]
                 self._notes.append("No geometry to frame a turntable around.")
 
         self._total = len(self._queue)
@@ -5154,9 +5576,320 @@ class MV_OT_RenderAll(Operator):
 
     def _job_render(self, context, job):
         self._render_image(context, job, job["camera"])
-        self._record(job["rec"], "render", job["master"], *self._render_size(context.scene))
+        self._record(job["rec"], job.get("record_as", "render"), job["master"],
+                     *self._render_size(context.scene))
         if job["post"]:
             self._job_post(context, job)
+
+    # -- annotations --------------------------------------------------------
+    def _write_json(self, path, payload):
+        """Write a JSON file, unless it already says exactly this: a resumed
+        batch then leaves its camera files untouched, as it does its images."""
+        text = json.dumps(payload, indent=2)
+        try:
+            with open(path, encoding="utf-8") as f:
+                if f.read() == text:
+                    return
+        except OSError:
+            pass
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def _job_cameras(self, context, job):
+        """cameras.json for every view, and transforms.json for the
+        perspective ones, which are the only ones a pinhole model describes."""
+        scene = context.scene
+        coll = bpy.data.collections.get(job["product"])
+        if coll is None:
+            raise RuntimeError(f"product '{job['product']}' no longer exists")
+        here = os.path.dirname(job["path"])
+
+        def rel(path):
+            return os.path.relpath(path, here).replace("\\", "/")
+
+        to_world = product_to_world(coll)
+        meta = job["rec"]
+        views, frames = [], []
+        for entry in job["views"]:
+            cam = bpy.data.objects.get(entry["camera"])
+            if cam is None or cam.type != 'CAMERA':
+                continue
+            record = camera_record(scene, cam)
+            record["view"] = entry["view"]
+            record["images"] = {mode or "render": rel(p) for mode, p in entry["files"].items()}
+            views.append(record)
+            if record["projection"] != "perspective":
+                continue
+            image = next((p for m, p in entry["files"].items()
+                          if m in {"", "render", "clay"}), None)
+            if image is None:
+                continue
+            (fx, _, cx), (_, fy, cy), _ = record["K"]
+            frame = {"file_path": rel(image), "transform_matrix": record["c2w_opengl"],
+                     "fl_x": fx, "fl_y": fy, "cx": cx, "cy": cy,
+                     "w": record["width"], "h": record["height"]}
+            if "mask" in entry["files"]:
+                frame["mask_path"] = rel(entry["files"]["mask"])
+            frames.append(frame)
+
+        payload = {
+            "generator": f"MultiView Product Renderer {'.'.join(map(str, bl_info['version']))}",
+            "blender": bpy.app.version_string,
+            "label": meta["label"], "product": meta["product"],
+            "source_file": meta.get("source_file", ""),
+            "source_units": meta.get("source_units", ""),
+            "source_size": meta.get("source_size"),
+            "model_to_world": [list(row) for row in to_world],
+            "conventions": {
+                "world": "Blender: +Z up, scene units",
+                "c2w_opengl": "camera to world, camera looks down -Z with +Y up",
+                "w2c_opencv": "world to camera, camera looks down +Z with +Y down",
+                "model_to_world": "source file coordinates (source_units) to world",
+                "depth": "EXR, distance along the view axis in scene units",
+                "normal": "EXR, camera space, OpenGL axes",
+                "parts": "16-bit PNG, 0 = background, n = parts[n-1]",
+            },
+            "parts": [{"id": i, "name": n} for n, i in sorted(job["parts"].items(),
+                                                              key=lambda p: p[1])],
+            "views": views,
+        }
+        self._write_json(job["path"], payload)
+        self._record(meta, "cameras", job["path"])
+        if frames:
+            self._write_json(job["transforms"], {"camera_model": "OPENCV", "frames": frames})
+            self._record(meta, "cameras", job["transforms"])
+
+    def _job_turn_cameras(self, context, job):
+        """transforms.json for a turntable. The product turns and the camera
+        stays put; the same pictures come from a camera circling a still
+        product, which is what NeRF-style tools expect, so each frame gets
+        that equivalent camera."""
+        self._end_turntable_pose()
+        scene = context.scene
+        cam = bpy.data.objects.get(TURNTABLE_CAM)
+        coll = bpy.data.collections.get(job["product"])
+        if cam is None or coll is None:
+            raise RuntimeError("turntable camera or product missing")
+        center, _ = bbox_of(collection_meshes(coll))
+        base = camera_record(scene, cam)
+        (fx, _, cx), (_, fy, cy), _ = base["K"]
+        here = os.path.dirname(job["path"])
+        n = len(job["frames"])
+        frames = []
+        for k, image in enumerate(job["frames"]):
+            angle = 2.0 * math.pi * k / n
+            orbit = (Matrix.Translation(center) @ Matrix.Rotation(-angle, 4, 'Z')
+                     @ Matrix.Translation(-center))
+            c2w = orbit @ cam.matrix_world.normalized()
+            frames.append({"file_path": os.path.relpath(image, here).replace("\\", "/"),
+                           "transform_matrix": [list(row) for row in c2w],
+                           "fl_x": fx, "fl_y": fy, "cx": cx, "cy": cy,
+                           "w": base["width"], "h": base["height"]})
+        self._write_json(job["path"], {"camera_model": "OPENCV", "frames": frames})
+        self._record(job["rec"], "cameras", job["path"])
+
+    def _job_bop(self, context, job):
+        """One BOP scene per product, from its perspective views.
+
+        Poses are rigid and in millimetres of the source model, as BOP wants,
+        although the scene was scaled to fit: the scale is taken back out of
+        the camera translation, and the model is exported in its own units.
+        """
+        scene = context.scene
+        s = scene.mv_settings
+        coll = bpy.data.collections.get(job["product"])
+        if coll is None:
+            raise RuntimeError(f"product '{job['product']}' no longer exists")
+        root = job["path"]
+        obj_id = job["index"] + 1
+        units_mm = UNIT_TO_MM.get(coll.mv_source_units, 1.0)
+        to_world = product_to_world(coll)
+        scale = abs(to_world.to_3x3().determinant()) ** (1.0 / 3.0) or 1.0
+        scene_dir = os.path.join(root, "train_pbr", f"{job['index']:06d}")
+        for sub in ("rgb", "depth", "mask", "mask_visib"):
+            os.makedirs(os.path.join(scene_dir, sub), exist_ok=True)
+
+        cams, gts, infos = {}, {}, {}
+        im_id = 0
+        for entry in job["views"]:
+            cam = bpy.data.objects.get(entry["camera"])
+            if cam is None or cam.data.type != 'PERSP':
+                continue
+            rgb = next((p for m, p in entry["files"].items() if m in {"", "render", "clay"}), None)
+            depth_exr = entry["files"].get("depth")
+            if not rgb or not depth_exr or not file_ok(rgb) or not file_ok(depth_exr):
+                continue
+            record = camera_record(scene, cam)
+            px = load_pixels(depth_exr, raw=True)[::-1]
+            hit = px[..., 3] > 0.5
+            depth_mm = np.where(hit, px[..., 0] / scale * units_mm, 0.0)
+            depth_scale = max(0.1, math.ceil(depth_mm.max() / 65000.0 * 10) / 10)
+            write_png16(os.path.join(scene_dir, "depth", f"{im_id:06d}.png"),
+                        np.rint(depth_mm / depth_scale))
+            shutil.copyfile(rgb, os.path.join(scene_dir, "rgb", f"{im_id:06d}"
+                                              + os.path.splitext(rgb)[1].lower()))
+            mask = np.zeros(hit.shape + (4,), np.float32)
+            mask[..., :3] = hit[::-1, :, None]
+            mask[..., 3] = 1.0
+            for sub in ("mask", "mask_visib"):
+                save_pixels(mask, os.path.join(scene_dir, sub, f"{im_id:06d}_000000.png"), 'PNG')
+
+            m2c = Matrix(record["w2c_opencv"]) @ to_world
+            rot = m2c.to_3x3() * (1.0 / scale)
+            t_mm = m2c.translation / scale * units_mm
+            ys, xs = np.nonzero(hit)
+            bbox = ([int(xs.min()), int(ys.min()), int(xs.max() - xs.min() + 1),
+                     int(ys.max() - ys.min() + 1)] if len(xs) else [-1, -1, 0, 0])
+            count = int(hit.sum())
+            key = str(im_id)
+            cams[key] = {"cam_K": [v for row in record["K"] for v in row],
+                         "depth_scale": depth_scale}
+            gts[key] = [{"obj_id": obj_id, "cam_R_m2c": [v for row in rot for v in row],
+                         "cam_t_m2c": list(t_mm)}]
+            infos[key] = [{"bbox_obj": bbox, "bbox_visib": bbox, "px_count_all": count,
+                           "px_count_valid": count, "px_count_visib": count,
+                           "visib_fract": 1.0 if count else 0.0}]
+            im_id += 1
+        if not im_id:
+            raise RuntimeError("no perspective view with both an image and depth")
+        self._write_json(os.path.join(scene_dir, "scene_camera.json"), cams)
+        self._write_json(os.path.join(scene_dir, "scene_gt.json"), gts)
+        self._write_json(os.path.join(scene_dir, "scene_gt_info.json"), infos)
+
+        first = cams["0"]["cam_K"]
+        w, h = render_resolution(scene)
+        camera_json = os.path.join(root, "camera.json")
+        if not os.path.isfile(camera_json):
+            self._write_json(camera_json, {"fx": first[0], "fy": first[4], "cx": first[2],
+                                           "cy": first[5], "width": w, "height": h,
+                                           "depth_scale": 0.1})
+        info = self._export_bop_model(coll, to_world, units_mm,
+                                      os.path.join(root, "models", f"obj_{obj_id:06d}.ply"))
+        info_path = os.path.join(root, "models", f"models_info{s.shard_suffix}.json")
+        try:
+            with open(info_path, encoding="utf-8") as f:
+                models = json.load(f)
+        except (OSError, ValueError):
+            models = {}
+        models[str(obj_id)] = info
+        self._write_json(info_path, models)
+        self._record(job["rec"], "bop", os.path.join(scene_dir, "scene_gt.json"))
+
+    def _export_bop_model(self, coll, to_world, units_mm, path):
+        """The product as a binary PLY in source-model millimetres, and its BOP
+        models_info entry. The diameter is the largest distance between any
+        two of up to 3000 sampled vertices, so it can fall slightly short on
+        dense meshes."""
+        back = to_world.inverted()
+        verts, faces, offset = [], [], 0
+        for obj in collection_meshes(coll):
+            if obj.type != 'MESH':
+                continue
+            me = obj.data
+            me.calc_loop_triangles()
+            co = np.empty(len(me.vertices) * 3, np.float64)
+            me.vertices.foreach_get("co", co)
+            m = np.array(back @ obj.matrix_world)
+            local = (co.reshape(-1, 3) @ m[:3, :3].T + m[:3, 3]) * units_mm
+            tri = np.empty(len(me.loop_triangles) * 3, np.int64)
+            me.loop_triangles.foreach_get("vertices", tri)
+            verts.append(local)
+            faces.append(tri.reshape(-1, 3) + offset)
+            offset += len(local)
+        verts = np.concatenate(verts).astype(np.float32)
+        faces = np.concatenate(faces).astype(np.int32)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write((f"ply\nformat binary_little_endian 1.0\nelement vertex {len(verts)}\n"
+                     "property float x\nproperty float y\nproperty float z\n"
+                     f"element face {len(faces)}\nproperty list uchar int vertex_indices\n"
+                     "end_header\n").encode("ascii"))
+            f.write(verts.astype("<f4").tobytes())
+            rows = np.empty(len(faces), dtype=[("n", "u1"), ("v", "<i4", 3)])
+            rows["n"] = 3
+            rows["v"] = faces
+            f.write(rows.tobytes())
+        lo, hi = verts.min(axis=0), verts.max(axis=0)
+        sample = verts[np.linspace(0, len(verts) - 1, min(len(verts), 3000)).astype(np.int64)]
+        diameter = 0.0
+        for i in range(0, len(sample), 500):
+            d = np.linalg.norm(sample[i:i + 500, None, :] - sample[None, :, :], axis=-1)
+            diameter = max(diameter, float(d.max()))
+        return {"diameter": diameter, "min_x": float(lo[0]), "min_y": float(lo[1]),
+                "min_z": float(lo[2]), "size_x": float(hi[0] - lo[0]),
+                "size_y": float(hi[1] - lo[1]), "size_z": float(hi[2] - lo[2])}
+
+    def _job_coco(self, context, job):
+        """coco.json: one instance per visible part per image, with the part's
+        name alongside. Categories are the products. Built from the part-ID
+        images on disk, so images skipped as already rendered are included,
+        and merged with a previous run's file the way the manifest is."""
+        root = self._out_root
+        images, annotations, categories = [], [], {}
+        for idx, product, meta, views, parts in job["sources"]:
+            names = {i: n for n, i in parts.items()}
+            categories[idx + 1] = {"id": idx + 1, "name": product, "supercategory": "product"}
+            for entry in views:
+                label_path = entry["files"].get("parts")
+                if not label_path or not file_ok(label_path):
+                    continue
+                labels = read_png16(label_path)
+                h, w = labels.shape
+                found = []
+                for part_id in np.unique(labels):
+                    if part_id == 0:
+                        continue
+                    mask = labels == part_id
+                    ys, xs = np.nonzero(mask)
+                    flat = mask.flatten(order="F").astype(np.int8)
+                    edges = np.flatnonzero(np.diff(flat)) + 1
+                    counts = np.diff(np.concatenate([[0], edges, [flat.size]])).tolist()
+                    if flat[0]:
+                        counts = [0] + counts
+                    found.append({
+                        "category_id": idx + 1, "iscrowd": 0, "area": int(mask.sum()),
+                        "bbox": [int(xs.min()), int(ys.min()), int(xs.max() - xs.min() + 1),
+                                 int(ys.max() - ys.min() + 1)],
+                        "segmentation": {"size": [h, w], "counts": counts},
+                        "part_id": int(part_id), "part_name": names.get(int(part_id), ""),
+                    })
+                for mode, path in entry["files"].items():
+                    if mode not in {"", "render", "clay"} or not file_ok(path):
+                        continue
+                    image_id = len(images) + 1
+                    images.append({"id": image_id, "width": w, "height": h,
+                                   "file_name": os.path.relpath(path, root).replace("\\", "/"),
+                                   "mv_label": meta["label"], "view": entry["view"],
+                                   "mode": mode})
+                    for ann in found:
+                        annotations.append(dict(ann, image_id=image_id))
+        # Carry over images of products this run did not touch.
+        try:
+            with open(job["path"], encoding="utf-8") as f:
+                old = json.load(f)
+        except (OSError, ValueError):
+            old = {}
+        mine = {m["label"] for _, _, m, _, _ in job["sources"]}
+        remap = {}
+        for image in old.get("images", []):
+            if image.get("mv_label") in mine:
+                continue
+            remap[image["id"]] = len(images) + 1
+            images.append(dict(image, id=remap[image["id"]]))
+        for ann in old.get("annotations", []):
+            if ann.get("image_id") in remap:
+                annotations.append(dict(ann, image_id=remap[ann["image_id"]]))
+        for cat in old.get("categories", []):
+            categories.setdefault(cat["id"], cat)
+        for i, ann in enumerate(annotations):
+            ann["id"] = i + 1
+        self._write_json(job["path"], {
+            "info": {"description": "MultiView Product Renderer part instances",
+                     "date_created": datetime.now().isoformat(timespec="seconds")},
+            "images": images, "annotations": annotations,
+            "categories": sorted(categories.values(), key=lambda c: c["id"]),
+        })
 
     def _job_post(self, context, job):
         s = context.scene.mv_settings
@@ -5262,7 +5995,9 @@ class MV_OT_RenderAll(Operator):
         handler = {
             "render": self._job_render, "post": self._job_post,
             "sheet": self._job_sheet, "turn_frame": self._job_turn_frame,
-            "turn_encode": self._job_turn_encode,
+            "turn_encode": self._job_turn_encode, "cameras": self._job_cameras,
+            "turn_cameras": self._job_turn_cameras, "bop": self._job_bop,
+            "coco": self._job_coco,
         }[job["kind"]]
         try:
             handler(context, job)
@@ -5293,7 +6028,8 @@ class MV_OT_RenderAll(Operator):
         if fmt == 'NONE' or not self._records:
             return
         try:
-            write_manifest(self._out_root, self._records, self._labels, fmt)
+            write_manifest(self._out_root, self._records, self._labels, fmt,
+                           "manifest" + context.scene.mv_settings.shard_suffix)
         except (OSError, ValueError) as exc:
             self._notes.append(f"Manifest not written: {exc}.")
 
@@ -5335,7 +6071,14 @@ class MV_OT_RenderAll(Operator):
     def _finish(self, context):
         self._restore(context)
         self._write_manifest(context)
-        return self._report_result()
+        result = self._report_result()
+        LAST_RENDER.clear()
+        LAST_RENDER.update(
+            images=self._done, jobs=self._processed(), total=self._total,
+            skipped=self._skipped, failures=list(self._failures), notes=list(self._notes),
+            cancelled=self._cancelled, aborted=self._aborted, output=self._out_root,
+            finished='FINISHED' in result)
+        return result
 
     def _teardown(self, context):
         wm = context.window_manager
@@ -5467,7 +6210,8 @@ class MV_UL_Products(UIList):
         row.prop(item, "mv_render", text="")
         sub = row.row(align=True)
         sub.active = item.mv_render
-        label = product_label(s.start_prefix, s.start_number, index, s.products_per_letter)
+        label = product_label(s.start_prefix, s.start_number, label_index(index, item),
+                              s.products_per_letter)
         sub.label(text=f"{label}  {item.name}", icon='OUTLINER_COLLECTION')
 
 
@@ -5804,7 +6548,8 @@ class MV_PT_Render(Panel):
         else:
             cam_coll = bpy.data.collections.get(CAMERA_COLL)
             n_cams = len([o for o in cam_coll.objects if o.type == 'CAMERA']) if cam_coll else 0
-        mult = (2 if s.render_mode == 'BOTH' else 1) + s.pass_lines + s.pass_mask + s.pass_ao
+        mult = ((2 if s.render_mode == 'BOTH' else 1) + s.pass_lines + s.pass_mask + s.pass_ao
+                + len(data_modes(s)))
         layout.label(text=f"{ticked} products x {n_cams} views x {mult} = {ticked * n_cams * mult} images")
         if s.turntable_enabled:
             layout.label(text=f"+ {ticked} turntable(s) x {s.turntable_frames} frames")
@@ -5988,6 +6733,33 @@ class MV_PT_RenderPasses(_RenderSubPanel, Panel):
                 layout.label(text="Needs the Cycles add-on.", icon='ERROR')
 
 
+class MV_PT_RenderAnnotations(_RenderSubPanel, Panel):
+    bl_label = "Annotations"
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.mv_settings
+        col = layout.column(align=True)
+        col.prop(s, "export_cameras", text="Cameras (cameras.json, transforms.json)")
+        layout.label(text="Data passes (Cycles, EXR / 16-bit PNG):")
+        row = layout.row(align=True)
+        row.prop(s, "pass_depth", toggle=True)
+        row.prop(s, "pass_normal", toggle=True)
+        row.prop(s, "pass_parts", toggle=True)
+        layout.label(text="Dataset formats:")
+        row = layout.row(align=True)
+        row.prop(s, "export_coco", toggle=True)
+        row.prop(s, "export_bop", toggle=True)
+        if s.export_coco and not s.pass_parts:
+            layout.label(text="COCO renders Part IDs too.", icon='INFO')
+        if s.export_bop:
+            if not s.pass_depth:
+                layout.label(text="BOP renders Depth too.", icon='INFO')
+            layout.label(text="BOP uses perspective views only.", icon='INFO')
+        if data_modes(s) and not hasattr(context.scene, "cycles"):
+            layout.label(text="Needs the Cycles add-on.", icon='ERROR')
+
+
 class MV_PT_RenderManifest(_RenderSubPanel, Panel):
     bl_label = "Manifest"
 
@@ -6045,6 +6817,7 @@ classes = (
     MV_PT_RenderTurntable,
     MV_PT_RenderPasses,
     MV_PT_RenderPost,
+    MV_PT_RenderAnnotations,
     MV_PT_RenderManifest,
 )
 
@@ -6084,6 +6857,19 @@ def register():
                     "scaled it, in the source file's units",
         size=3,
     )
+    bpy.types.Collection.mv_to_world = FloatVectorProperty(
+        name="Source to World",
+        description="Row-major 4x4 matrix from the product's source coordinates to the "
+                    "scene, accumulated from every move MultiView has made to it",
+        size=16, default=IDENTITY_16,
+    )
+    bpy.types.Collection.mv_label_index = IntProperty(
+        name="Label Index",
+        description="Position in the batch this product's label is taken from. -1 uses "
+                    "its place in MV_Products; the command line sets it so shards "
+                    "rendered separately still get labels that do not collide",
+        default=-1, min=-1,
+    )
     bpy.types.Collection.mv_source_units = StringProperty(
         name="Source Units",
         description="Unit Source Size is in: mm, cm, m, in or ft. Empty when not known",
@@ -6091,6 +6877,8 @@ def register():
 
 
 def unregister():
+    del bpy.types.Collection.mv_label_index
+    del bpy.types.Collection.mv_to_world
     del bpy.types.Collection.mv_source_units
     del bpy.types.Collection.mv_source_size
     del bpy.types.Collection.mv_source
