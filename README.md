@@ -8,7 +8,8 @@ every view in one click, with predictable file names like `AA_01_Widget_Front_cl
 
 - **Blender:** 4.0 and newer
 - **Panel location:** `3D Viewport → Sidebar (N key) → MultiView`
-- **Version:** 1.10.0
+- **Version:** 1.11.0
+- **Cite:** see [`CITATION.cff`](CITATION.cff)
 
 ---
 
@@ -293,6 +294,28 @@ product reads at the same scale across the whole sheet rather than being re-fitt
 Need an angle that isn't in the presets? Add a **Custom View** with an X/Y/Z direction
 vector and an ortho/perspective toggle, and it gets built alongside the rest. The checkbox at
 the start of its row switches it off without deleting it.
+
+#### Published protocols
+
+**Protocol** replaces the View Set with the camera rig of a published dataset or method, so
+a render set can match what a benchmark or model expects:
+
+| Protocol | Views | Field of view | Distance | Source |
+| --- | --- | --- | --- | --- |
+| **MVCNN, 12 views** | 12 around the product, 30 degrees apart, 30 degrees up | MultiView's | Shared framing | Su et al., ICCV 2015 |
+| **SyncDreamer, 16 views** | 16 around, 22.5 degrees apart, 30 degrees up | MultiView's | Shared framing | Liu et al., ICLR 2024 |
+| **Zero123++ v1.2, 6 views** | Azimuths 30, 90, ..., 330; elevations alternating 20 and -10 | 30 degrees | Shared framing | Shi et al., v1.2 README |
+| **MVDream, 4 views** | Front, right, back, left at 15 degrees up | 37.5 degrees | Shared framing | Shi et al., ICLR 2024 (middle of its random ranges) |
+| **Zero-1-to-3, 12 random views** | Uniform on the sphere, seeded | 49.1 degrees | 1.5-2.2 object sizes, seeded | Liu et al., ICCV 2023 |
+| **TRELLIS, 150 views** | Hammersley sequence on the sphere, seeded offset | 40 degrees | 2 object sizes | Xiang et al., CVPR 2025 |
+| **Catalogue, 15 degree plunge** | Front at 0 and 15 degrees; front-right, right, back, left, front-left at 15 | MultiView's | Shared framing | After the GS1 Product Image Specification's preferred plunge (names are MultiView's, not GS1 codes) |
+
+Azimuth 0 is the Front view, so protocols follow **Front Axis** like the built-in views.
+Distances given in object sizes assume the product is normalized into a unit cube, as these
+works do, and are multiplied by **Target Size**: with **Fit Each** and a Target Size of
+`1.0` they are the published numbers. Random protocols take a **Seed**, so the same rig can be
+built again exactly. MVDream samples its elevation and field of view at random; the preset
+fixes them at the middle of its ranges, and the paper should say so if it matters.
 
 #### Orient Products
 
@@ -603,6 +626,28 @@ Rendering part of a batch updates the rows for those products and keeps the rest
 manifest always describes everything in the output directory. Rows for files that have
 since been deleted are dropped.
 
+Every row also carries `source_sha256`, the SHA-256 hash of the file it was rendered from.
+`manifest.json` opens with a `provenance` block holding enough to make the output again:
+- MultiView's version, repository and citation
+- the Blender version and the `.blend` file
+- render engine, samples, resolution, file format and view transform
+- start and finish times
+- a snapshot of every setting in the panels, including protocol and randomization seeds
+
+**Croissant** (in the Manifest section) also writes `croissant.json`: an
+[MLCommons Croissant 1.0](https://docs.mlcommons.org/croissant/docs/croissant-spec.html)
+description of the output as a dataset, which the NeurIPS datasets track asks for.
+- The manifest CSV is its record set, one field per column, with its checksum.
+- Each file type in the output (PNG, EXR, SVG, ...) is a file set.
+- Name, description, licence, URL and citation come from the fields under the checkbox.
+  Without a citation, the dataset cites MultiView itself.
+- The Responsible AI fields are filled with what the tool knows for certain: synthetic
+  renders of the listed files, no personal data. Intended use and limitations are left for
+  you to add.
+
+Croissant always writes the CSV manifest, whatever **Write** is set to. After a sharded
+command-line run, `--merge` writes `croissant.json` for the merged whole.
+
 ---
 
 #### Annotations for research
@@ -652,6 +697,53 @@ The scale is taken back out of the camera translation, the model is exported in 
 source units converted to mm, and depth is written in the same mm, with a `depth_scale` per
 image so large parts still fit in 16 bits. Only perspective views go into BOP, because the
 format has no orthographic camera.
+
+#### Engineering drawings
+
+Tick **Drawings** for vector three-view drawings of each product: Front, Top and Right as
+separate SVGs (`AA_01_Widget_Front_drawing.svg`, ...), and all three on one sheet
+(`AA_01_Widget_Drawing.svg`).
+
+- **True scale.** One SVG unit is one millimetre of the original part: a 120 mm housing
+  is drawn 120 mm wide at 1:1, whatever Target Size it was rendered at. MultiView takes back
+  out every scale it applied.
+- **Hidden lines dashed.** Lines are the mesh's feature edges, found geometrically: creases
+  sharper than **Crease Angle**, silhouettes and open boundaries. Each is then tested
+  against a depth image of the same view, along its whole length, so a line that passes
+  behind something turns dashed exactly where it disappears. **Accuracy** is that depth
+  image's size; raise it for very fine detail.
+- **Drafting layout.** The views use cameras of their own, oriented the way a drawing
+  needs. The plan is seen with the front at the bottom, so its width lines up with the front
+  elevation's, and the side view stands upright. **Third Angle** puts the plan above and the
+  right view on the right; **First Angle** puts the plan below and the right view on the
+  left.
+- **Dimensions** print each view's overall width and height in millimetres.
+
+Because lines come from the mesh, a curved face's tessellation can add short creases where
+the facets are coarse. A higher Crease Angle, or a finer Tessellation Deflection at import,
+removes them. The drawings have no centre lines or detailed dimensioning; they are
+a faithful outline, not a finished drawing.
+
+#### Randomization
+
+**Randomize** varies each image for training data while keeping every annotation exact:
+
+| Setting | What varies |
+| --- | --- |
+| **Camera Jitter**, **Distance Jitter** | Each view's camera swings up to this far off its canonical direction, and moves nearer or farther |
+| **Lights** | The rig turns about the vertical by up to **Light Turn**, and each light changes strength by up to **Light Strength** |
+| **HDRI** | Each image is lit and backed by a random HDRI from **HDRI Folder** (empty: the studio HDRIs that ship with Blender), turned and scaled at random |
+| **Materials** | The product gets a random material preset and colour per image, in Full renders |
+| **Distractors** | Random shapes in random colours, placed behind the product as each camera sees it, in Full renders |
+
+Every draw comes from the **Seed**, the product's label and the view, so the same settings
+always give the same images. A product or view added later does not shift anyone else's
+numbers. A view's image, mask, depth, normals and part IDs are all rendered from the same
+jittered camera, and that is the camera `cameras.json`, `transforms.json` and BOP record.
+Distractors are only ever placed on the far side of the product from the camera, so they
+never cover it, and they appear only in Full renders. Masks, part IDs, COCO instances and BOP
+visibility therefore stay exactly the product. Turntables are not randomized. Everything is
+put back afterwards: lights, world, cameras, and the distractors are deleted.
 
 ## Command line
 

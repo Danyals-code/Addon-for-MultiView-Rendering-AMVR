@@ -282,6 +282,16 @@ def merge(mv, folder):
                     row = dict(row, source_size=" x ".join(f"{v:g}" for v in size))
                 writer.writerow(row)
         merged.append(f"manifest ({len(shards)} shards, {len(rows)} rows)")
+        # The shards recorded their settings; if they asked for Croissant,
+        # describe the merged whole now that it exists.
+        with open(shards[0], encoding="utf-8") as f:
+            settings = json.load(f).get("provenance", {}).get("settings", {})
+        if settings.get("export_croissant"):
+            mv.write_croissant(folder, "manifest", {
+                "name": settings.get("dataset_name"), "description": settings.get("dataset_description"),
+                "license": settings.get("dataset_license"), "url": settings.get("dataset_url"),
+                "citeAs": settings.get("dataset_cite")})
+            merged.append("Croissant metadata")
 
     shards = sorted(glob.glob(os.path.join(folder, "coco_shard*.json")))
     if shards:

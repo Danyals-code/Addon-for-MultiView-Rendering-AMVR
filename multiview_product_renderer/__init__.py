@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MultiView Product Renderer",
     "author": "Danyal Sarfraz",
-    "version": (1, 10, 0),
+    "version": (1, 11, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > MultiView",
     "description": "Import CAD and mesh files, set up cameras and studio lighting, batch render products across views.",
@@ -128,6 +128,7 @@ CAMERA_COLL = "MV_Cameras"
 LIGHT_COLL = "MV_Lighting"
 PRODUCT_COLL = "MV_Products"
 STAGE_COLL = "MV_Stage"
+DISTRACTOR_COLL = "MV_Distractors"
 WORLD_NAME = "MV_World"
 GROUND_NAME = "MV_Ground"
 
@@ -155,7 +156,9 @@ GUIDE_LINES = [
     "   Optional extras under Batch Render: contact sheets, turntables",
     "   (MP4/GIF), post-processed copies, and a CSV/JSON manifest.",
     "   Annotations adds cameras.json/transforms.json, depth, normals,",
-    "   part IDs, COCO and BOP for building datasets.",
+    "   part IDs, COCO and BOP for building datasets. Drawings writes",
+    "   1:1 SVG three-views with hidden lines; Randomize varies images",
+    "   for training data, seeded. Cameras > Protocol matches published rigs.",
     "",
     "Headless: blender -b --python multiview_product_renderer/cli.py",
     "  -- --config job.json   (see README, Command line)",
@@ -165,6 +168,121 @@ GUIDE_LINES = [
     "Render engine, samples, resolution and file format stay under your",
     "control in Blender's Output and Render properties.",
 ]
+
+
+# -- published view protocols ----------------------------------------------------
+#
+# Camera rigs from papers that render 3D object collections, so a dataset can
+# be rendered the way a benchmark expects. Azimuth 0 is the Front view and 90
+# the Right view; elevation is above the horizon. "radius" is a camera
+# distance in units of the object's largest dimension, as these works
+# normalize into a unit cube; it is multiplied by Target Size. Views without a
+# radius use MultiView's own shared framing. "fov" is the horizontal field of
+# view in degrees (sensor fitted to the longer image side).
+
+def sphere_dir(azimuth, elevation):
+    a, e = math.radians(azimuth), math.radians(elevation)
+    return (math.sin(a) * math.cos(e), -math.cos(a) * math.cos(e), math.sin(e))
+
+
+def _radical_inverse(i):
+    result, f = 0.0, 0.5
+    while i:
+        result += f * (i & 1)
+        i >>= 1
+        f *= 0.5
+    return result
+
+
+def _hammersley_views(n, rng):
+    """TRELLIS's sphere Hammersley sequence, with its random offset seeded."""
+    off_u, off_v = rng.random(), rng.random()
+    views = []
+    for i in range(n):
+        u = i / n + off_u / n
+        v = (_radical_inverse(i) + off_v) % 1.0
+        u = 2 * u if u < 0.25 else 2 / 3 * u + 1 / 3
+        pitch = math.acos(max(-1.0, min(1.0, 1 - 2 * u))) - math.pi / 2
+        yaw = v * 2 * math.pi
+        views.append((math.cos(yaw) * math.cos(pitch), math.sin(yaw) * math.cos(pitch),
+                      math.sin(pitch)))
+    return views
+
+
+def _uniform_sphere(n, rng):
+    dirs = rng.normal(size=(n, 3))
+    return [tuple(d / np.linalg.norm(d)) for d in dirs]
+
+
+VIEW_PROTOCOLS = {
+    'MVCNN_12': {
+        "label": "MVCNN, 12 views",
+        "source": "Su et al., Multi-view CNNs, ICCV 2015 (arXiv 1505.00880)",
+        "make": lambda rng: [(f"MVCNN_{i:02d}", sphere_dir(30 * i, 30), None) for i in range(12)],
+    },
+    'SYNCDREAMER_16': {
+        "label": "SyncDreamer, 16 views",
+        "source": "Liu et al., SyncDreamer, ICLR 2024 (arXiv 2309.03453)",
+        "make": lambda rng: [(f"SD_{i:02d}", sphere_dir(22.5 * i, 30), None) for i in range(16)],
+    },
+    'ZERO123PP_6': {
+        "label": "Zero123++ v1.2, 6 views",
+        "source": "Shi et al., Zero123++ (arXiv 2310.15110), v1.2 README",
+        "fov": 30.0,
+        "make": lambda rng: [(f"Z123PP_{i}", sphere_dir(30 + 60 * i, 20 if i % 2 == 0 else -10), None)
+                             for i in range(6)],
+    },
+    'MVDREAM_4': {
+        "label": "MVDream, 4 views",
+        "source": "Shi et al., MVDream, ICLR 2024 (arXiv 2308.16512); elevation and field "
+                  "of view fixed at the middle of its random ranges",
+        "fov": 37.5,
+        "make": lambda rng: [(f"MVD_{i}", sphere_dir(90 * i, 15), None) for i in range(4)],
+    },
+    'ZERO123_12': {
+        "label": "Zero-1-to-3, 12 random views",
+        "source": "Liu et al., Zero-1-to-3, ICCV 2023 (arXiv 2303.11328)",
+        "fov": 49.1, "random": True,
+        "make": lambda rng: [(f"Z123_{i:02d}", d, float(rng.uniform(1.5, 2.2)))
+                             for i, d in enumerate(_uniform_sphere(12, rng))],
+    },
+    'TRELLIS_150': {
+        "label": "TRELLIS, 150 views",
+        "source": "Xiang et al., TRELLIS, CVPR 2025 (arXiv 2412.01506), dataset_toolkits/render.py",
+        "fov": 40.0, "random": True,
+        "make": lambda rng: [(f"TRL_{i:03d}", d, 2.0)
+                             for i, d in enumerate(_hammersley_views(150, rng))],
+    },
+    'GS1_15': {
+        "label": "Catalogue, 15 degree plunge",
+        "source": "After the GS1 Product Image Specification's preferred 15 degree plunge for "
+                  "3D images; view names are MultiView's, not GS1 file codes",
+        "make": lambda rng: [("Front_0", sphere_dir(0, 0), None),
+                             ("Front_15", sphere_dir(0, 15), None),
+                             ("FrontRight_15", sphere_dir(45, 15), None),
+                             ("Right_15", sphere_dir(90, 15), None),
+                             ("Back_15", sphere_dir(180, 15), None),
+                             ("Left_15", sphere_dir(270, 15), None),
+                             ("FrontLeft_15", sphere_dir(315, 15), None)],
+    },
+}
+PROTOCOL_ITEMS = [('NONE', "None (use View Set)", "Pick views with the View Set below")] + [
+    (k, v["label"], v["source"]) for k, v in VIEW_PROTOCOLS.items()]
+
+
+def protocol_views(settings):
+    """[(name, direction, radius or None)] for the active protocol, or None."""
+    spec = VIEW_PROTOCOLS.get(settings.view_protocol)
+    if spec is None:
+        return None
+    return spec["make"](np.random.default_rng(settings.protocol_seed))
+
+
+def protocol_lens(settings):
+    spec = VIEW_PROTOCOLS.get(settings.view_protocol)
+    if not spec or "fov" not in spec:
+        return PERSP_LENS
+    return SENSOR_WIDTH / 2.0 / math.tan(math.radians(spec["fov"]) / 2.0)
 
 
 class MV_AddonPreferences(AddonPreferences):
@@ -348,6 +466,20 @@ class MV_Settings(PropertyGroup):
         ],
         default="ALL",
         update=_update_view_set,
+    )
+    view_protocol: EnumProperty(
+        name="Protocol",
+        description="Use the camera rig of a published dataset or method instead of the "
+                    "View Set: its views, field of view and, where it fixes them, camera "
+                    "distances",
+        items=PROTOCOL_ITEMS,
+        default='NONE',
+    )
+    protocol_seed: IntProperty(
+        name="Seed",
+        description="Seed for protocols whose views are random, so the same rig can be "
+                    "built again",
+        default=0, min=0,
     )
     views_enabled: BoolVectorProperty(
         name="Views",
@@ -537,6 +669,102 @@ class MV_Settings(PropertyGroup):
                     "depth in mm, masks, object poses and models. Turns on Depth",
         default=False,
     )
+    export_drawings: BoolProperty(
+        name="Drawings",
+        description="Write vector three-view engineering drawings (Front, Top, Right) as "
+                    "SVG at 1:1 in the product's source units, hidden lines dashed, plus a "
+                    "sheet with all three. Needs Cycles",
+        default=False,
+    )
+    drawing_crease: FloatProperty(
+        name="Crease Angle",
+        description="Edges where faces meet more sharply than this are drawn",
+        default=math.radians(30.0), min=math.radians(1.0), max=math.radians(179.0),
+        subtype='ANGLE',
+    )
+    drawing_resolution: IntProperty(
+        name="Accuracy",
+        description="Size in pixels of the depth image used to decide which lines are "
+                    "hidden. Higher is more exact near overlaps, and slower",
+        default=2048, min=256, max=8192,
+    )
+    drawing_projection: EnumProperty(
+        name="Projection",
+        items=[('THIRD', "Third Angle", "Plan above the front view, right view on its right "
+                                        "(US, ISO E)"),
+               ('FIRST', "First Angle", "Plan below the front view, right view on its left "
+                                        "(Europe, ISO A)")],
+        default='THIRD',
+    )
+    drawing_hidden: BoolProperty(name="Hidden Lines", default=True,
+                                 description="Draw hidden edges dashed")
+    drawing_dimensions: BoolProperty(name="Dimensions", default=True,
+                                     description="Overall width and height of each view")
+    random_enabled: BoolProperty(
+        name="Randomize",
+        description="Vary cameras, lights, environment, materials and clutter per image, "
+                    "for training data. Every draw comes from the seed, the product's "
+                    "label and the view, so a run can be repeated exactly. Turntables are "
+                    "not randomized",
+        default=False,
+    )
+    random_seed: IntProperty(name="Seed", default=0, min=0)
+    random_camera_angle: FloatProperty(
+        name="Camera Jitter",
+        description="Each view's camera swings up to this far off its canonical direction",
+        default=math.radians(8.0), min=0.0, max=math.radians(45.0), subtype='ANGLE',
+    )
+    random_camera_distance: FloatProperty(
+        name="Distance Jitter",
+        description="Each perspective camera moves this fraction nearer or farther",
+        default=0.1, min=0.0, max=0.5, subtype='FACTOR',
+    )
+    random_lights: BoolProperty(name="Lights", default=True,
+                                description="Turn the light rig and vary each light's strength")
+    random_light_yaw: FloatProperty(
+        name="Light Turn", default=math.radians(60.0), min=0.0, max=math.radians(180.0),
+        subtype='ANGLE', description="The rig turns up to this far about the vertical",
+    )
+    random_light_energy: FloatProperty(
+        name="Light Strength", default=0.4, min=0.0, max=0.9, subtype='FACTOR',
+        description="Each light is up to this fraction stronger or weaker",
+    )
+    random_hdri: BoolProperty(
+        name="HDRI", default=False,
+        description="Light and back each image with a random HDRI, turned and scaled at random",
+    )
+    random_hdri_folder: StringProperty(
+        name="HDRI Folder", subtype='DIR_PATH',
+        description="Folder of .hdr/.exr environments. Empty uses the studio HDRIs that ship "
+                    "with Blender",
+    )
+    random_hdri_min: FloatProperty(name="Min Strength", default=0.5, min=0.0)
+    random_hdri_max: FloatProperty(name="Max Strength", default=1.5, min=0.0)
+    random_material: BoolProperty(
+        name="Materials", default=False,
+        description="Give the product a random material preset and colour per image, in "
+                    "Full renders",
+    )
+    random_distractors: IntProperty(
+        name="Distractors", default=0, min=0, max=24,
+        description="Random shapes placed behind the product, never in front of it, in Full "
+                    "renders only, so masks and annotations stay exact",
+    )
+    export_croissant: BoolProperty(
+        name="Croissant",
+        description="Write croissant.json, MLCommons Croissant metadata describing the "
+                    "output as a dataset (needed for NeurIPS datasets submissions). Writes "
+                    "the CSV manifest too",
+        default=False,
+    )
+    dataset_name: StringProperty(name="Name", description="Dataset name. Empty uses the "
+                                 "output folder's name")
+    dataset_description: StringProperty(name="Description")
+    dataset_license: StringProperty(
+        name="License", description="Licence of the rendered dataset, e.g. CC-BY-4.0 or a URL")
+    dataset_url: StringProperty(name="URL", description="Where the dataset is published")
+    dataset_cite: StringProperty(
+        name="Cite As", description="BibTeX for the dataset. Empty cites MultiView itself")
     shard_suffix: StringProperty(
         description="Added to manifest, COCO and BOP model-info file names by the "
                     "command line, so shards rendered in parallel do not overwrite "
@@ -894,10 +1122,8 @@ def stray_render_objects(context):
     products = set()
     for pc in get_products():
         products.update(pc.all_objects)
-    # The ground is the add-on's own, placed under each product on purpose.
-    stage = bpy.data.collections.get(STAGE_COLL)
-    if stage:
-        products.update(stage.all_objects)
+    # The ground and distractors are the add-on's own, placed on purpose.
+    products.update(staging_objects())
 
     strays = []
     for obj in context.view_layer.objects:
@@ -2377,9 +2603,14 @@ def persp_distance(local, tan_x, tan_y, pad):
 def planned_views(settings):
     """(name, kind, direction) for every view a camera should be built for.
 
-    A preset is read from VIEW_SETS rather than from the checkboxes, so a file
-    saved before the checkboxes existed still gets exactly the views it chose.
+    A protocol replaces the View Set and custom views entirely, so its rig is
+    exactly the published one. Otherwise a preset is read from VIEW_SETS
+    rather than from the checkboxes, so a file saved before the checkboxes
+    existed still gets exactly the views it chose.
     """
+    protocol = protocol_views(settings)
+    if protocol is not None:
+        return [(name, "persp", d) for name, d, _ in protocol]
     if settings.view_set == 'CUSTOM':
         views = [v for v, on in zip(VIEWS_ALL, settings.views_enabled) if on]
     else:
@@ -2411,10 +2642,13 @@ def build_cameras(context):
     diag = max(max((p - center).length for p in corners), 1e-3)
     pad = max(settings.frame_padding_factor, 1.0)
     rx, ry = image_aspect(context.scene)
-    tan_x, tan_y = sensor_tangents(rx, ry)
+    lens = protocol_lens(settings)
+    tan_x, tan_y = sensor_tangents(rx, ry, lens)
 
     angle = FRONT_AXIS_ANGLES[settings.front_axis]
     views = planned_views(settings)
+    # A protocol may pin each camera's distance, in object sizes.
+    radii = {name: r for name, _, r in (protocol_views(settings) or []) if r}
 
     # Pass 1: measure every view and take the worst case, so one ortho framing
     # and one perspective framing cover the whole set. Sizing each camera to its
@@ -2454,8 +2688,8 @@ def build_cameras(context):
             distance = ortho_dist
         else:
             cam_data.type = 'PERSP'
-            cam_data.lens = PERSP_LENS
-            distance = persp_dist
+            cam_data.lens = lens
+            distance = (radii[name] * settings.target_size) if name in radii else persp_dist
         cam_data.clip_start = max(distance * 0.01, 1e-5)
         # Far enough for the ground, which runs fifty product sizes out; any
         # shorter and a perspective view sees the floor stop before the horizon.
@@ -2623,6 +2857,16 @@ def node_tree_of(idblock):
     return idblock.node_tree
 
 
+def staging_objects():
+    """The add-on's own scenery: the ground and any randomization distractors."""
+    found = []
+    for name in (STAGE_COLL, DISTRACTOR_COLL):
+        coll = bpy.data.collections.get(name)
+        if coll is not None:
+            found.extend(coll.all_objects)
+    return found
+
+
 def build_ground(context):
     """Rebuild MV_Stage's ground to match the settings, or clear it for None."""
     s = context.scene.mv_settings
@@ -2782,11 +3026,14 @@ def material_node_group():
     return group
 
 
-def apply_product_material(settings, coll):
-    """Give a product its preset material for rendering. False when it keeps its own."""
+def apply_product_material(settings, coll, force=False):
+    """Give a product its preset material for rendering. False when it keeps
+    its own. force puts a modifier on even then, for Randomize to vary."""
     choice = product_material_choice(settings, coll)
     if choice is None:
-        return False
+        if not force:
+            return False
+        choice = ("MATTE_PLASTIC", (0.8, 0.8, 0.8))
     mat = preset_material(f"MV_Material_{coll.name}", *choice)
     group = material_node_group()
     socket = next(item.identifier for item in group.interface.items_tree
@@ -3992,6 +4239,249 @@ def _do_parts_render(scene, filepath, part_map):
 
 # (name, render function, file extension). Unlike the image modes these are
 # never post-processed or put on a contact sheet: they are data.
+# -- engineering drawings ------------------------------------------------------
+#
+# Vector three-view drawings of a product, true to scale in its source units.
+# Lines are the mesh's feature edges -- creases sharper than the crease angle,
+# silhouettes and open boundaries -- found geometrically, then split into
+# visible and hidden stretches by testing points along each edge against a
+# depth render of the same view. Hidden stretches are drawn dashed, as in a
+# technical drawing.
+#
+# The three views use cameras of their own rather than the render rig's,
+# because a drawing has rules a render rig does not: the plan is seen with the
+# product's front at the bottom, so its horizontal lines up with the front
+# elevation, and the side view stands upright beside it.
+
+DRAWING_VIEWS = ("Front", "Top", "Right")
+
+
+def _drawing_bases(settings):
+    """{view: (right, up, toward camera)} as world unit vectors."""
+    front = Vector(rotate_dir_z((0.0, -1.0, 0.0), FRONT_AXIS_ANGLES[settings.front_axis]))
+    z = Vector((0.0, 0.0, 1.0))
+    right = z.cross(front)
+    return {
+        "Front": (right, z, front),
+        "Top": (right, -front, z),
+        "Right": (z.cross(right), z, right),
+    }
+
+
+def _feature_edges(obj, toward, crease_cos):
+    """World endpoints (n, 2, 3) of an object's feature edges as seen looking
+    against `toward` (the direction to the camera)."""
+    me = obj.data
+    nv, ne, nl, npoly = len(me.vertices), len(me.edges), len(me.loops), len(me.polygons)
+    if not ne or not npoly:
+        return np.zeros((0, 2, 3))
+    m = np.array(obj.matrix_world)
+    co = np.empty(nv * 3)
+    me.vertices.foreach_get("co", co)
+    co = co.reshape(-1, 3) @ m[:3, :3].T + m[:3, 3]
+    edges = np.empty(ne * 2, np.int64)
+    me.edges.foreach_get("vertices", edges)
+    edges = edges.reshape(-1, 2)
+    normals = np.empty(npoly * 3)
+    me.polygons.foreach_get("normal", normals)
+    normal_matrix = np.linalg.inv(m[:3, :3]).T
+    normals = normals.reshape(-1, 3) @ normal_matrix.T
+    normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
+    loop_edge = np.empty(nl, np.int64)
+    me.loops.foreach_get("edge_index", loop_edge)
+    totals = np.empty(npoly, np.int64)
+    me.polygons.foreach_get("loop_total", totals)
+    loop_poly = np.repeat(np.arange(npoly), totals)
+
+    order = np.argsort(loop_edge, kind="stable")
+    sorted_edges, sorted_polys = loop_edge[order], loop_poly[order]
+    uniq, first, counts = np.unique(sorted_edges, return_index=True, return_counts=True)
+    feature = np.zeros(ne, bool)
+    feature[uniq[counts != 2]] = True             # open boundaries and non-manifold
+    pair = counts == 2
+    e2, f1, f2 = uniq[pair], sorted_polys[first[pair]], sorted_polys[first[pair] + 1]
+    n1, n2 = normals[f1], normals[f2]
+    crease = (n1 * n2).sum(axis=1) < crease_cos
+    facing = np.asarray(toward)
+    silhouette = (n1 @ facing) * (n2 @ facing) < 0
+    feature[e2[crease | silhouette]] = True
+    feature[np.setdiff1d(np.arange(ne), uniq)] = True   # loose edges
+    return co[edges[feature]]
+
+
+def drawing_view(context, coll, view, basis, settings):
+    """Visible and hidden polylines of one view, in source units, paper axes
+    (x right, y down), centred on the product."""
+    scene = context.scene
+    right, up, toward = (Vector(v).normalized() for v in basis)
+    meshes = [o for o in collection_meshes(coll) if o.type == 'MESH']
+    center, size = bbox_of(meshes)
+    to_world = product_to_world(coll)
+    scale = abs(to_world.to_3x3().determinant()) ** (1.0 / 3.0) or 1.0
+    units_mm = UNIT_TO_MM.get(coll.mv_source_units, 1.0)
+
+    half = size * 0.5
+    corners = [center + Vector((x, y, z)) for x in (-half.x, half.x)
+               for y in (-half.y, half.y) for z in (-half.z, half.z)]
+    ex = max(abs((c - center).dot(right)) for c in corners) * 1.05 + 1e-6
+    ey = max(abs((c - center).dot(up)) for c in corners) * 1.05 + 1e-6
+    reach = max((c - center).dot(toward) for c in corners)
+    long_side = settings.drawing_resolution
+    if ex >= ey:
+        w, h = long_side, max(8, int(round(long_side * ey / ex)))
+        pixel = 2 * ex / w
+    else:
+        w, h = max(8, int(round(long_side * ex / ey))), long_side
+        pixel = 2 * ey / h
+
+    data = bpy.data.cameras.new("MV_Drawing_Cam")
+    data.type = 'ORTHO'
+    data.ortho_scale = pixel * max(w, h)
+    distance = reach + size.length + 1e-3
+    data.clip_start = 1e-4
+    data.clip_end = distance + size.length * 2 + 1.0
+    cam = bpy.data.objects.new("MV_Drawing_Cam", data)
+    scene.collection.objects.link(cam)
+    position = center + toward * distance
+    basis_m = Matrix((right, up, toward)).transposed()
+    cam.matrix_world = Matrix.Translation(position) @ basis_m.to_4x4()
+    r = scene.render
+    work = tempfile.mkdtemp(prefix="mv_drawing_")
+    try:
+        with temporarily((scene, "camera", cam), (r, "resolution_x", w), (r, "resolution_y", h),
+                         (r, "resolution_percentage", 100),
+                         (r, "pixel_aspect_x", 1.0), (r, "pixel_aspect_y", 1.0)):
+            px = load_pixels(_render_data(scene, os.path.join(work, "depth"), "depth"), raw=True)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        remove_object(cam)
+    depth = np.where(px[..., 3] > 0.5, px[..., 0], np.inf)[::-1]
+    # The farthest depth among a pixel and its neighbours: a line exactly on a
+    # silhouette or a step stays visible however the pixel grid falls.
+    padded = np.pad(depth, 1, mode="edge")
+    deepest = np.max([padded[1 + dy:1 + dy + h, 1 + dx:1 + dx + w]
+                      for dy in (-1, 0, 1) for dx in (-1, 0, 1)], axis=0)
+
+    segments = np.concatenate([_feature_edges(o, toward, math.cos(settings.drawing_crease))
+                               for o in meshes]) if meshes else np.zeros((0, 2, 3))
+    if not len(segments):
+        return {"visible": [], "hidden": []}
+    rel = segments - np.array(center)
+    xs = rel @ np.array(right)
+    ys = rel @ np.array(up)
+    zs = distance - rel @ np.array(toward)
+    u = w / 2 + xs / pixel
+    v = h / 2 - ys / pixel
+    length = np.hypot(u[:, 1] - u[:, 0], v[:, 1] - v[:, 0])
+    steps = np.maximum(np.ceil(length).astype(np.int64), 1) + 1
+    edge_of = np.repeat(np.arange(len(segments)), steps)
+    offsets = np.arange(edge_of.size) - np.repeat(np.cumsum(steps) - steps, steps)
+    t = offsets / np.repeat(steps - 1, steps)
+    su = u[edge_of, 0] + (u[edge_of, 1] - u[edge_of, 0]) * t
+    sv = v[edge_of, 0] + (v[edge_of, 1] - v[edge_of, 0]) * t
+    sz = zs[edge_of, 0] + (zs[edge_of, 1] - zs[edge_of, 0]) * t
+    iu = np.clip(np.floor(su).astype(np.int64), 0, w - 1)
+    iv = np.clip(np.floor(sv).astype(np.int64), 0, h - 1)
+    visible = sz <= deepest[iv, iu] + 2.5 * pixel
+
+    # Runs of samples on one edge with one visibility become one line.
+    to_paper = pixel / scale * units_mm
+    px_x = (su - w / 2) * to_paper
+    px_y = (sv - h / 2) * to_paper
+    breaks = np.flatnonzero((np.diff(edge_of) != 0) | (np.diff(visible.astype(np.int8)) != 0)) + 1
+    starts = np.concatenate([[0], breaks])
+    ends = np.concatenate([breaks, [edge_of.size]]) - 1
+    lines = {"visible": [], "hidden": []}
+    for a, b in zip(starts, ends):
+        # A run on its own owns the samples at both ends; where two runs meet,
+        # extend to the shared boundary so dashes join their solid lines.
+        b2 = b + 1 if b + 1 < edge_of.size and edge_of[b + 1] == edge_of[a] else b
+        if b2 == a:
+            continue
+        line = (float(px_x[a]), float(px_y[a]), float(px_x[b2]), float(px_y[b2]))
+        lines["visible" if visible[a] else "hidden"].append(line)
+    return lines
+
+
+def _bounds(lines):
+    pts = [(x, y) for group in lines.values() for l in group for x, y in (l[:2], l[2:])]
+    if not pts:
+        return 0.0, 0.0, 0.0, 0.0
+    xs, ys = zip(*pts)
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def drawing_svg(placed, title, unit, show_hidden=True, dimensions=True):
+    """An SVG of one or more views. placed: [(lines, dx, dy)] in paper units."""
+    all_bounds = [(_bounds(lines), dx, dy) for lines, dx, dy in placed]
+    x0 = min(b[0] + dx for b, dx, dy in all_bounds)
+    y0 = min(b[1] + dy for b, dx, dy in all_bounds)
+    x1 = max(b[2] + dx for b, dx, dy in all_bounds)
+    y1 = max(b[3] + dy for b, dx, dy in all_bounds)
+    size = max(x1 - x0, y1 - y0, 1e-6)
+    margin = size * 0.12
+    stroke = size / 400
+    dash = size / 80
+    text = size / 45
+    x0, y0, x1, y1 = x0 - margin, y0 - margin, x1 + margin, y1 + margin
+
+    def path(lines, dx, dy):
+        return " ".join(f"M{a + dx:.4f} {b + dy:.4f}L{c + dx:.4f} {d + dy:.4f}"
+                        for a, b, c, d in lines)
+
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{x1 - x0:.3f}{unit}" '
+           f'height="{y1 - y0:.3f}{unit}" viewBox="{x0:.4f} {y0:.4f} {x1 - x0:.4f} {y1 - y0:.4f}">',
+           f"<title>{title}</title>",
+           f'<desc>Scale 1:1, units {unit}. Generated by MultiView Product Renderer.</desc>',
+           f'<rect x="{x0:.4f}" y="{y0:.4f}" width="{x1 - x0:.4f}" height="{y1 - y0:.4f}" fill="white"/>']
+    for lines, dx, dy in placed:
+        if show_hidden and lines["hidden"]:
+            out.append(f'<path class="hidden" d="{path(lines["hidden"], dx, dy)}" fill="none" '
+                       f'stroke="#555" stroke-width="{stroke * 0.6:.4f}" '
+                       f'stroke-dasharray="{dash:.4f} {dash * 0.6:.4f}" stroke-linecap="round"/>')
+        if lines["visible"]:
+            out.append(f'<path class="visible" d="{path(lines["visible"], dx, dy)}" fill="none" '
+                       f'stroke="black" stroke-width="{stroke:.4f}" stroke-linecap="round"/>')
+        if dimensions and (lines["visible"] or lines["hidden"]):
+            bx0, by0, bx1, by1 = _bounds(lines)
+            bx0, bx1, by0, by1 = bx0 + dx, bx1 + dx, by0 + dy, by1 + dy
+            gap = margin * 0.35
+            tick = stroke * 4
+            dim = (f"M{bx0:.4f} {by1 + gap:.4f}L{bx1:.4f} {by1 + gap:.4f}"
+                   f"M{bx0:.4f} {by1 + gap - tick:.4f}L{bx0:.4f} {by1 + gap + tick:.4f}"
+                   f"M{bx1:.4f} {by1 + gap - tick:.4f}L{bx1:.4f} {by1 + gap + tick:.4f}"
+                   f"M{bx1 + gap:.4f} {by0:.4f}L{bx1 + gap:.4f} {by1:.4f}"
+                   f"M{bx1 + gap - tick:.4f} {by0:.4f}L{bx1 + gap + tick:.4f} {by0:.4f}"
+                   f"M{bx1 + gap - tick:.4f} {by1:.4f}L{bx1 + gap + tick:.4f} {by1:.4f}")
+            out.append(f'<path class="dimension" d="{dim}" fill="none" stroke="#06c" '
+                       f'stroke-width="{stroke * 0.5:.4f}"/>')
+            out.append(f'<text class="dimension" x="{(bx0 + bx1) / 2:.4f}" y="{by1 + gap - tick * 1.5:.4f}" '
+                       f'font-size="{text:.4f}" text-anchor="middle" fill="#06c" '
+                       f'font-family="sans-serif">{bx1 - bx0:.2f}</text>')
+            out.append(f'<text class="dimension" x="{bx1 + gap + tick * 1.5:.4f}" y="{(by0 + by1) / 2:.4f}" '
+                       f'font-size="{text:.4f}" fill="#06c" font-family="sans-serif" '
+                       f'dominant-baseline="middle">{by1 - by0:.2f}</text>')
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+def sheet_layout(views, projection):
+    """Offsets placing Front, Top and Right on one sheet. Third angle puts the
+    plan above the front and the right side view on its right; first angle
+    puts the plan below and the right side view on the left."""
+    fx0, fy0, fx1, fy1 = _bounds(views["Front"])
+    tx0, ty0, tx1, ty1 = _bounds(views["Top"])
+    rx0, ry0, rx1, ry1 = _bounds(views["Right"])
+    gap = max(fx1 - fx0, fy1 - fy0, 1e-6) * 0.25
+    if projection == 'THIRD':
+        top_dy = fy0 - gap - ty1
+        right_dx = fx1 + gap - rx0
+    else:
+        top_dy = fy1 + gap - ty0
+        right_dx = fx0 - gap - rx1
+    return [(views["Front"], 0.0, 0.0), (views["Top"], 0.0, top_dy), (views["Right"], right_dx, 0.0)]
+
+
 def data_modes(settings):
     s = settings
     modes = []
@@ -4020,7 +4510,7 @@ def render_resolution(scene):
             int(r.resolution_y * r.resolution_percentage / 100))
 
 
-def camera_record(scene, cam):
+def camera_record(scene, cam, matrix=None):
     """Everything needed to project the scene into one of this camera's images.
 
     Extrinsics come in both conventions in use: camera-to-world in OpenGL axes
@@ -4032,7 +4522,7 @@ def camera_record(scene, cam):
     r = scene.render
     w, h = render_resolution(scene)
     data = cam.data
-    c2w = cam.matrix_world.normalized()
+    c2w = (matrix if matrix is not None else cam.matrix_world).normalized()
     flip = Matrix(((1, 0, 0, 0), (0, -1, 0, 0), (0, 0, -1, 0), (0, 0, 0, 1)))
     w2c_cv = flip @ c2w.inverted()
     pax, pay = r.pixel_aspect_x, r.pixel_aspect_y
@@ -4680,7 +5170,160 @@ def encode_gif(frames, out_path, fps, max_size, background):
 
 MEASURABLE_IMAGES = {".png", ".jpg", ".jpeg", ".webp", ".exr", ".tif", ".tiff", ".bmp"}
 MANIFEST_FIELDS = ("label", "product", "kind", "view", "mode", "path",
-                   "width", "height", "source_file", "source_size", "source_units")
+                   "width", "height", "source_file", "source_size", "source_units",
+                   "source_sha256")
+
+
+REPOSITORY_URL = "https://github.com/Danyals-code/Addon-for-MultiView-Rendering-AMVR"
+
+
+def tool_version():
+    return ".".join(map(str, bl_info["version"]))
+
+
+def tool_citation():
+    return ("@software{sarfraz_multiview_product_renderer, author = {Sarfraz, Danyal}, "
+            "title = {MultiView Product Renderer}, version = {%s}, url = {%s}, "
+            "license = {MIT}}" % (tool_version(), REPOSITORY_URL))
+
+
+def file_sha256(path):
+    import hashlib
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def settings_snapshot(settings):
+    """Every panel setting by name, as plain JSON values."""
+    snap = {}
+    for prop in settings.bl_rna.properties:
+        key = prop.identifier
+        if key == "rna_type" or prop.type in {'COLLECTION', 'POINTER'} or prop.is_hidden:
+            continue
+        value = getattr(settings, key)
+        if hasattr(value, "__len__") and not isinstance(value, str):
+            value = [round(v, 6) if isinstance(v, float) else v for v in value]
+        elif isinstance(value, float):
+            value = round(value, 6)
+        snap[key] = value
+    snap["custom_views"] = [{"name": cv.name, "enabled": cv.enabled, "ortho": cv.is_ortho,
+                             "direction": [cv.dir_x, cv.dir_y, cv.dir_z]}
+                            for cv in settings.custom_views]
+    return snap
+
+
+def provenance(context, started):
+    """How this output was made, precisely enough to make it again."""
+    scene = context.scene
+    r = scene.render
+    engine = r.engine
+    samples = None
+    if engine == 'CYCLES' and hasattr(scene, "cycles"):
+        samples = scene.cycles.samples
+    elif hasattr(scene, "eevee"):
+        samples = getattr(scene.eevee, "taa_render_samples", None)
+    return {
+        "tool": "MultiView Product Renderer", "version": tool_version(),
+        "repository": REPOSITORY_URL, "citeAs": tool_citation(),
+        "blender": bpy.app.version_string, "blend_file": bpy.data.filepath or None,
+        "engine": engine, "samples": samples,
+        "resolution": list(render_resolution(scene)),
+        "file_format": r.image_settings.file_format,
+        "view_transform": scene.view_settings.view_transform,
+        "started": started.isoformat(timespec="seconds"),
+        "finished": datetime.now().isoformat(timespec="seconds"),
+        "settings": settings_snapshot(scene.mv_settings),
+    }
+
+
+CROISSANT_CONTEXT = {
+    "@language": "en", "@vocab": "https://schema.org/", "sc": "https://schema.org/",
+    "cr": "http://mlcommons.org/croissant/", "rai": "http://mlcommons.org/croissant/RAI/",
+    "dct": "http://purl.org/dc/terms/",
+    "citeAs": "cr:citeAs", "column": "cr:column", "conformsTo": "dct:conformsTo",
+    "data": {"@id": "cr:data", "@type": "@json"},
+    "dataType": {"@id": "cr:dataType", "@type": "@vocab"},
+    "examples": {"@id": "cr:examples", "@type": "@json"},
+    "extract": "cr:extract", "field": "cr:field", "fileProperty": "cr:fileProperty",
+    "fileObject": "cr:fileObject", "fileSet": "cr:fileSet", "format": "cr:format",
+    "includes": "cr:includes", "isLiveDataset": "cr:isLiveDataset", "jsonPath": "cr:jsonPath",
+    "key": "cr:key", "md5": "cr:md5", "parentField": "cr:parentField", "path": "cr:path",
+    "recordSet": "cr:recordSet", "references": "cr:references", "regex": "cr:regex",
+    "repeated": "cr:repeated", "replace": "cr:replace", "separator": "cr:separator",
+    "source": "cr:source", "subField": "cr:subField", "transform": "cr:transform",
+    "samplingRate": "cr:samplingRate", "equivalentProperty": "cr:equivalentProperty",
+}
+CROISSANT_TYPES = {"width": "sc:Integer", "height": "sc:Integer"}
+MEDIA_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+               ".webp": "image/webp", ".exr": "image/x-exr", ".tif": "image/tiff",
+               ".tiff": "image/tiff", ".svg": "image/svg+xml", ".mp4": "video/mp4",
+               ".gif": "image/gif", ".json": "application/json"}
+
+
+def write_croissant(out_root, manifest_name, meta):
+    """croissant.json describing the output as an MLCommons Croissant 1.0
+    dataset: the manifest CSV as its one record set, and a file set per file
+    type found in the output. meta: name, description, license, url, citeAs.
+
+    Responsible-AI fields are filled with what the tool knows for certain
+    (synthetic renders of the listed source files); anything about intended
+    use is left for the dataset's author to add.
+    """
+    csv_path = os.path.join(out_root, manifest_name + ".csv")
+    found = set()
+    for folder, _, files in os.walk(out_root):
+        for name in files:
+            ext = file_ext(name)
+            if ext in MEDIA_TYPES and not name.startswith(("manifest", "croissant")):
+                found.add(ext)
+    distribution = [{
+        "@type": "cr:FileObject", "@id": "manifest", "name": "manifest",
+        "contentUrl": manifest_name + ".csv", "encodingFormat": "text/csv",
+        "sha256": file_sha256(csv_path),
+    }]
+    for ext in sorted(found):
+        distribution.append({"@type": "cr:FileSet", "@id": f"files{ext.replace('.', '-')}",
+                             "name": f"{ext[1:]} files", "encodingFormat": MEDIA_TYPES[ext],
+                             "includes": f"**/*{ext}"})
+    fields = [{
+        "@type": "cr:Field", "@id": f"outputs/{column}", "name": column,
+        "dataType": CROISSANT_TYPES.get(column, "sc:Text"),
+        "source": {"fileObject": {"@id": "manifest"}, "extract": {"column": column}},
+    } for column in MANIFEST_FIELDS]
+    doc = {
+        "@context": CROISSANT_CONTEXT, "@type": "sc:Dataset",
+        "name": meta.get("name") or os.path.basename(os.path.normpath(out_root)),
+        "description": meta.get("description") or
+        "Multi-view renders made with MultiView Product Renderer.",
+        "conformsTo": "http://mlcommons.org/croissant/1.0",
+        "citeAs": meta.get("citeAs") or tool_citation(),
+        "datePublished": datetime.now().date().isoformat(),
+        "version": "1.0.0",
+        "distribution": distribution,
+        "recordSet": [{"@type": "cr:RecordSet", "@id": "outputs", "name": "outputs",
+                       "description": "One row per file written, from the manifest.",
+                       "field": fields}],
+        "rai:dataCollection": "Synthetic images rendered in Blender by MultiView Product "
+                              "Renderer from the CAD and mesh files named in source_file; "
+                              "the settings used are in the manifest's provenance.",
+        "rai:dataCollectionType": "Synthetic data",
+        "rai:personalSensitiveInformation": "None: renders of manufactured products.",
+    }
+    if meta.get("license"):
+        doc["license"] = meta["license"]
+    if meta.get("url"):
+        doc["url"] = meta["url"]
+    with open(os.path.join(out_root, "croissant.json"), "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2)
+
+
+def croissant_meta(settings):
+    return {"name": settings.dataset_name, "description": settings.dataset_description,
+            "license": settings.dataset_license, "url": settings.dataset_url,
+            "citeAs": settings.dataset_cite}
 
 
 def read_manifest(out_root, name="manifest"):
@@ -4698,7 +5341,7 @@ def read_manifest(out_root, name="manifest"):
     return []
 
 
-def write_manifest(out_root, records, labels, fmt, name="manifest"):
+def write_manifest(out_root, records, labels, fmt, name="manifest", provenance=None):
     """Merge this run's outputs into manifest.json / manifest.csv.
 
     Rows for products this run did not touch are carried over, so rendering
@@ -4721,8 +5364,11 @@ def write_manifest(out_root, records, labels, fmt, name="manifest"):
 
     if fmt in {'JSON', 'BOTH'}:
         with open(os.path.join(out_root, name + ".json"), "w", encoding="utf-8") as f:
-            json.dump({"generated": datetime.now().isoformat(timespec="seconds"),
-                       "images": rows}, f, indent=2)
+            payload = {"generated": datetime.now().isoformat(timespec="seconds")}
+            if provenance:
+                payload["provenance"] = provenance
+            payload["images"] = rows
+            json.dump(payload, f, indent=2)
     if fmt in {'CSV', 'BOTH'}:
         with open(os.path.join(out_root, name + ".csv"), "w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS, extrasaction='ignore')
@@ -4733,6 +5379,122 @@ def write_manifest(out_root, records, labels, fmt, name="manifest"):
                     row = dict(row, source_size=" x ".join(f"{v:g}" for v in size))
                 writer.writerow(row)
     return len(rows)
+
+
+# -- randomization ------------------------------------------------------------
+
+HDRI_EXTENSIONS = {".hdr", ".exr"}
+RANDOM_MATERIALS = [k for k in MATERIAL_PRESETS if k != "GLASS"]
+
+
+def view_rng(settings, label, view, salt):
+    """The random stream for one draw of one view: the same seed, product and
+    view always give the same numbers, whatever else ran before."""
+    return np.random.default_rng([settings.random_seed, zlib.crc32(label.encode("utf-8")),
+                                  zlib.crc32(view.encode("utf-8")), salt])
+
+
+def jittered_matrix(settings, label, view, matrix, center):
+    """The camera matrix a view is rendered with: its canonical one, swung
+    and pushed when Randomize moves cameras. Every pass of the view, and its
+    cameras.json entry, ask for this, so they all agree."""
+    if not settings.random_enabled or (settings.random_camera_angle <= 0
+                                       and settings.random_camera_distance <= 0):
+        return matrix.copy()
+    offset = matrix.translation - center
+    distance = offset.length
+    if distance < 1e-9:
+        return matrix.copy()
+    rng = view_rng(settings, label, view, 1)
+    d = offset / distance
+    axis = Vector(rng.normal(size=3))
+    axis -= d * axis.dot(d)
+    if axis.length < 1e-9:
+        axis = d.orthogonal()
+    axis.normalize()
+    angle = settings.random_camera_angle * math.sqrt(rng.random())
+    d = Matrix.Rotation(angle, 3, axis) @ d
+    distance *= 1.0 + settings.random_camera_distance * rng.uniform(-1.0, 1.0)
+    return look_at(center + d * distance, center)
+
+
+def hdri_files(settings):
+    folder = (bpy.path.abspath(settings.random_hdri_folder) if settings.random_hdri_folder
+              else bpy.utils.system_resource('DATAFILES', path=os.path.join("studiolights", "world")))
+    if not folder or not os.path.isdir(folder):
+        return []
+    return sorted(os.path.join(folder, f) for f in os.listdir(folder)
+                  if file_ext(f) in HDRI_EXTENSIONS)
+
+
+def random_world(path, rotation, strength):
+    world = bpy.data.worlds.get("MV_Random_World") or bpy.data.worlds.new("MV_Random_World")
+    tree = node_tree_of(world)
+    nodes = {n.name: n for n in tree.nodes}
+    if "MV_Env" not in nodes:
+        tree.nodes.clear()
+        coords = tree.nodes.new("ShaderNodeTexCoord")
+        mapping = tree.nodes.new("ShaderNodeMapping")
+        mapping.name = "MV_Mapping"
+        env = tree.nodes.new("ShaderNodeTexEnvironment")
+        env.name = "MV_Env"
+        bg = tree.nodes.new("ShaderNodeBackground")
+        bg.name = "MV_Background"
+        out = tree.nodes.new("ShaderNodeOutputWorld")
+        tree.links.new(coords.outputs["Generated"], mapping.inputs["Vector"])
+        tree.links.new(mapping.outputs["Vector"], env.inputs["Vector"])
+        tree.links.new(env.outputs["Color"], bg.inputs["Color"])
+        tree.links.new(bg.outputs["Background"], out.inputs["Surface"])
+        nodes = {n.name: n for n in tree.nodes}
+    nodes["MV_Env"].image = bpy.data.images.load(path, check_existing=True)
+    nodes["MV_Mapping"].inputs["Rotation"].default_value[2] = rotation
+    nodes["MV_Background"].inputs["Strength"].default_value = strength
+    return world
+
+
+def build_distractors(count):
+    """Simple shapes in MV_Distractors, hidden until a Full render places them."""
+    import bmesh
+    coll = ensure_collection(DISTRACTOR_COLL)
+    clear_collection_objects(coll)
+    names = []
+    for i in range(count):
+        bm = bmesh.new()
+        kind = i % 4
+        if kind == 0:
+            bmesh.ops.create_cube(bm, size=1.0)
+        elif kind == 1:
+            bmesh.ops.create_uvsphere(bm, u_segments=24, v_segments=12, radius=0.5)
+        else:
+            bmesh.ops.create_cone(bm, cap_ends=True, cap_tris=False, segments=24, radius1=0.5,
+                                  radius2=0.5 if kind == 2 else 0.0, depth=1.0)
+        name = f"MV_Distractor_{i:02d}"
+        me = bpy.data.meshes.new(name)
+        bm.to_mesh(me)
+        bm.free()
+        mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+        node_tree_of(mat)
+        me.materials.append(mat)
+        obj = bpy.data.objects.new(name, me)
+        obj.hide_render = True
+        coll.objects.link(obj)
+        names.append(name)
+    return names
+
+
+def remove_distractors():
+    coll = bpy.data.collections.get(DISTRACTOR_COLL)
+    if coll is not None:
+        clear_collection_objects(coll)
+        bpy.data.collections.remove(coll)
+    for mat in [m for m in bpy.data.materials if m.name.startswith("MV_Distractor_")]:
+        if not mat.users:
+            bpy.data.materials.remove(mat)
+
+
+def _random_colour(rng):
+    import colorsys
+    return colorsys.hsv_to_rgb(rng.random(), rng.uniform(0.1, 0.9), rng.uniform(0.15, 0.95))
 
 
 def render_modes(settings):
@@ -4778,6 +5540,7 @@ def framing_signature(context):
         "box": [round(v, 4) for v in (*center, *size)],
         "views": [(name, kind, [round(c, 4) for c in d]) for name, kind, d in planned_views(s)],
         "front": s.front_axis, "pad": round(s.frame_padding_factor, 4),
+        "protocol": [s.view_protocol, s.protocol_seed, round(s.target_size, 6)],
         "aspect": round(rx / ry, 4),
     }, sort_keys=True)
 
@@ -4932,8 +5695,12 @@ def preflight(context, only_active=False):
     # Engine-specific passes and staging.
     if s.pass_ao and not hasattr(scene, "cycles"):
         _issue(issues, 'ERROR', "AO pass needs the Cycles add-on")
-    if data_modes(s) and not hasattr(scene, "cycles"):
-        _issue(issues, 'ERROR', "Depth/normal/part passes need Cycles")
+    if (data_modes(s) or s.export_drawings) and not hasattr(scene, "cycles"):
+        _issue(issues, 'ERROR', "Data passes and drawings need Cycles")
+    if s.random_enabled and s.random_hdri and not hdri_files(s):
+        _issue(issues, 'WARNING', "Randomize: no HDRIs in the HDRI folder")
+    if s.export_croissant and not s.dataset_license:
+        _issue(issues, 'WARNING', "Croissant: dataset has no licence set")
     if s.export_bop:
         if s.reframe_on_render:
             persp = [v for v in planned_views(s) if v[1] == "persp"]
@@ -5145,6 +5912,7 @@ class MV_OT_RenderAll(Operator):
 
     def _restore(self, context):
         scene = context.scene
+        self._random_restore(context)
         self._end_turntable_pose()
         cam = bpy.data.objects.get(TURNTABLE_CAM)
         if cam is not None:
@@ -5179,14 +5947,31 @@ class MV_OT_RenderAll(Operator):
             remove_product_materials()
             coll = bpy.data.collections.get(product)
             if coll is not None:
-                apply_product_material(context.scene.mv_settings, coll)
+                s = context.scene.mv_settings
+                apply_product_material(s, coll, force=s.random_enabled and s.random_material)
 
     def _stage(self, context, job, camera):
         """Turn the lights to this camera and stand the ground under this
         product, for the image about to be rendered."""
         s = context.scene.mv_settings
+        # Randomize first: it may move the camera, and the lights and ground
+        # follow wherever the camera ends up.
+        self._randomize(context, job, camera)
+        randomized = (self._random is not None and s.random_lights and job.get("rec")
+                      and job["kind"] != "turn_frame")
         if s.lights_follow_camera:
             orient_light_rig(context, camera)
+        elif randomized:
+            reset_light_rig()
+        rig = bpy.data.objects.get(LIGHT_RIG)
+        if randomized and rig is not None:
+            # A fresh turn from the rig's oriented pose each image, never
+            # piled on top of the previous image's.
+            rng = view_rng(s, job["rec"]["label"], job["rec"]["view"], 2)
+            c = rig.matrix_world.translation.copy()
+            yaw = s.random_light_yaw * rng.uniform(-1.0, 1.0)
+            rig.matrix_world = (Matrix.Translation(c) @ Matrix.Rotation(yaw, 4, 'Z')
+                                @ Matrix.Translation(-c) @ rig.matrix_world)
         ground = bpy.data.objects.get(GROUND_NAME)
         if ground is None:
             return
@@ -5200,6 +5985,132 @@ class MV_OT_RenderAll(Operator):
         # hides the product altogether from Bottom.
         ground.hide_render = (job["render"] is not _do_full_render
                               or camera.matrix_world.translation.z <= floor + 1e-6)
+
+    # -- randomization ----------------------------------------------------
+    def _random_setup(self, context):
+        s = context.scene.mv_settings
+        if not s.random_enabled:
+            return
+        center, _ = batch_extent()
+        lights = bpy.data.collections.get(LIGHT_COLL)
+        self._random = {
+            "center": center,
+            "world": context.scene.world.name if context.scene.world else None,
+            "energies": {o.name: o.data.energy for o in (lights.objects if lights else [])
+                         if o.type == 'LIGHT'},
+            "hdris": hdri_files(s) if s.random_hdri else [],
+            "distractors": build_distractors(s.random_distractors),
+            "bounds": {},
+        }
+        if s.random_hdri and not self._random["hdris"]:
+            self._notes.append("Randomize: no .hdr/.exr files in the HDRI folder.")
+
+    def _put_camera_back(self):
+        if self._cam_restore:
+            name, matrix = self._cam_restore
+            cam = bpy.data.objects.get(name)
+            if cam is not None:
+                cam.matrix_world = matrix
+            self._cam_restore = None
+
+    def _camera_matrix(self, scene, label, view, cam):
+        """The matrix a view was rendered with, for cameras.json and BOP."""
+        if self._random is None:
+            return cam.matrix_world.copy()
+        return jittered_matrix(scene.mv_settings, label, view, cam.matrix_world,
+                               self._random["center"])
+
+    def _randomize(self, context, job, camera):
+        state = self._random
+        if state is None:
+            return
+        scene = context.scene
+        s = scene.mv_settings
+        full = job["render"] is _do_full_render
+        rec = job.get("rec")
+        names = state["distractors"]
+        if job["kind"] == "turn_frame" or not rec:
+            for name in names:
+                obj = bpy.data.objects.get(name)
+                if obj is not None:
+                    obj.hide_render = True
+            return
+        label, view = rec["label"], rec["view"]
+
+        canonical = camera.matrix_world.copy()
+        moved = jittered_matrix(s, label, view, canonical, state["center"])
+        if moved != canonical:
+            camera.matrix_world = moved
+            self._cam_restore = (camera.name, canonical)
+
+        if s.random_lights:
+            # The rig's turn is applied in _stage, after it faces the camera.
+            rng = view_rng(s, label, view, 5)
+            for name, base in state["energies"].items():
+                obj = bpy.data.objects.get(name)
+                if obj is not None:
+                    obj.data.energy = base * (1.0 + s.random_light_energy * rng.uniform(-1.0, 1.0))
+
+        if state["hdris"]:
+            rng = view_rng(s, label, view, 3)
+            path = state["hdris"][int(rng.integers(len(state["hdris"])))]
+            scene.world = random_world(path, rng.uniform(0.0, 2.0 * math.pi),
+                                       rng.uniform(s.random_hdri_min, s.random_hdri_max))
+
+        if s.random_material and full:
+            rng = view_rng(s, label, view, 4)
+            preset = RANDOM_MATERIALS[int(rng.integers(len(RANDOM_MATERIALS)))]
+            preset_material(f"MV_Material_{job['product']}", preset, _random_colour(rng))
+
+        if not names:
+            return
+        bounds = state["bounds"].get(job["product"])
+        if bounds is None:
+            c, size = bbox_of(collection_meshes(bpy.data.collections[job["product"]]))
+            bounds = state["bounds"][job["product"]] = (c, max(size.length * 0.5, 1e-3))
+        center, radius = bounds
+        toward = (moved.translation - center).normalized()
+        for i, name in enumerate(names):
+            obj = bpy.data.objects.get(name)
+            if obj is None:
+                continue
+            obj.hide_render = not full
+            if not full:
+                continue
+            rng = view_rng(s, label, view, 100 + i)
+            # Behind the product as this camera sees it, and clear of it, so
+            # nothing ever stands between the camera and the product.
+            for _ in range(32):
+                d = Vector(rng.normal(size=3)).normalized()
+                if d.dot(toward) < -0.25:
+                    break
+            else:
+                d = -toward
+            obj.location = center + d * radius * rng.uniform(1.6, 2.6)
+            obj.rotation_euler = tuple(rng.uniform(0.0, 2.0 * math.pi, size=3))
+            obj.scale = tuple(radius * rng.uniform(0.15, 0.45, size=3))
+            mat = obj.data.materials[0] if obj.data.materials else None
+            if mat is not None:
+                bsdf = next((n for n in node_tree_of(mat).nodes
+                             if n.bl_idname == "ShaderNodeBsdfPrincipled"), None)
+                colour = (*_random_colour(rng), 1.0)
+                if bsdf is not None:
+                    bsdf.inputs["Base Color"].default_value = colour
+                    bsdf.inputs["Roughness"].default_value = float(rng.uniform(0.1, 0.9))
+                mat.diffuse_color = colour
+
+    def _random_restore(self, context):
+        state, self._random = self._random, None
+        self._put_camera_back()
+        if state is None:
+            return
+        if state["world"] is not None:
+            context.scene.world = bpy.data.worlds.get(state["world"])
+        for name, base in state["energies"].items():
+            obj = bpy.data.objects.get(name)
+            if obj is not None:
+                obj.data.energy = base
+        remove_distractors()
 
     def _record(self, rec, kind, path, width=None, height=None):
         self._records.append(dict(rec, kind=kind, path=path, width=width, height=height))
@@ -5225,6 +6136,7 @@ class MV_OT_RenderAll(Operator):
             "source_file": pc.mv_source or "",
             "source_size": [round(v, 6) for v in size] if any(size) else None,
             "source_units": pc.mv_source_units if any(size) else "",
+            "source_sha256": self._hash(pc.mv_source),
         }
 
     def _post_targets(self, rel_dir, base):
@@ -5338,6 +6250,25 @@ class MV_OT_RenderAll(Operator):
                                     "views": views, "rec": meta})
             if s.export_coco:
                 coco_sources.append((idx, pc.name, meta, views, parts))
+            if s.export_drawings:
+                paths = {}
+                for view in DRAWING_VIEWS:
+                    values = name_values(s, idx, pc.name, view, "drawing")
+                    paths[view] = os.path.join(root, output_folder(s, values),
+                                               output_basename(s, values) + ".svg")
+                values = name_values(s, idx, pc.name, "Drawing", "")
+                sheet = os.path.join(root, output_folder(s, values),
+                                     output_basename(s, values) + ".svg")
+                for path in [*paths.values(), sheet]:
+                    self._claim(path)
+                rec = dict(meta, view="Drawing", mode="drawing")
+                if s.skip_existing and all(file_ok(p) for p in [*paths.values(), sheet]):
+                    for path in [*paths.values(), sheet]:
+                        self._record(rec, "drawing", path)
+                else:
+                    self._queue.append({"kind": "drawing", "product": pc.name,
+                                        "status": f"{name} drawings", "path": sheet,
+                                        "views": paths, "rec": rec})
 
             if s.turntable_enabled:
                 self._plan_turntable(context, idx, pc, meta)
@@ -5433,6 +6364,10 @@ class MV_OT_RenderAll(Operator):
         self._turn_pose = None
         self._ground_z = {}
         self._ground_home = None
+        self._hashes = {}
+        self._started_at = datetime.now()
+        self._random = None
+        self._cam_restore = None
         self._cancelled = False
         self._aborted = False
 
@@ -5493,6 +6428,7 @@ class MV_OT_RenderAll(Operator):
                 if s.ground_mode == 'SHADOW' and scene.render.engine != 'CYCLES':
                     self._notes.append("Shadow Catcher needs Cycles; other engines "
                                        "show the ground as a plain floor.")
+        self._random_setup(context)
         if s.lights_follow_camera and bpy.data.collections.get(LIGHT_COLL) \
                 and bpy.data.objects.get(LIGHT_RIG) is None:
             self._notes.append("Lights Follow Camera needs the lighting rebuilt once "
@@ -5566,9 +6502,12 @@ class MV_OT_RenderAll(Operator):
         scene.camera = cam
         self._stage(context, job, cam)
         started = time.monotonic()
-        # bpy.ops.render.render raises RuntimeError when the image cannot be
-        # written; _advance turns that into a named failure, not a traceback.
-        job["render"](scene, job["path"], *job["extra"])
+        try:
+            # bpy.ops.render.render raises RuntimeError when the image cannot
+            # be written; _advance turns that into a named failure.
+            job["render"](scene, job["path"], *job["extra"])
+        finally:
+            self._put_camera_back()
         self._render_time += time.monotonic() - started
         self._renders_done += 1
         self._done += 1
@@ -5615,7 +6554,8 @@ class MV_OT_RenderAll(Operator):
             cam = bpy.data.objects.get(entry["camera"])
             if cam is None or cam.type != 'CAMERA':
                 continue
-            record = camera_record(scene, cam)
+            record = camera_record(scene, cam, self._camera_matrix(scene, meta["label"],
+                                                                   entry["view"], cam))
             record["view"] = entry["view"]
             record["images"] = {mode or "render": rel(p) for mode, p in entry["files"].items()}
             views.append(record)
@@ -5641,6 +6581,7 @@ class MV_OT_RenderAll(Operator):
             "source_units": meta.get("source_units", ""),
             "source_size": meta.get("source_size"),
             "model_to_world": [list(row) for row in to_world],
+            "randomized": self._random is not None,
             "conventions": {
                 "world": "Blender: +Z up, scene units",
                 "c2w_opengl": "camera to world, camera looks down -Z with +Y up",
@@ -5659,6 +6600,31 @@ class MV_OT_RenderAll(Operator):
         if frames:
             self._write_json(job["transforms"], {"camera_model": "OPENCV", "frames": frames})
             self._record(meta, "cameras", job["transforms"])
+
+    def _job_drawing(self, context, job):
+        s = context.scene.mv_settings
+        coll = bpy.data.collections.get(job["product"])
+        if coll is None:
+            raise RuntimeError(f"product '{job['product']}' no longer exists")
+        self._isolate(context, job["product"])
+        context.view_layer.update()
+        # Only the product may stand in the depth image lines are tested against.
+        hide = [(o, "hide_render", True) for o in staging_objects()]
+        with temporarily(*hide):
+            bases = _drawing_bases(s)
+            views = {v: drawing_view(context, coll, v, bases[v], s) for v in DRAWING_VIEWS}
+        unit = "mm" if coll.mv_source_units in UNIT_TO_MM else ""
+        title = f"{job['rec']['label']}_{job['product']}"
+        for view, path in job["views"].items():
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(drawing_svg([(views[view], 0.0, 0.0)], f"{title} {view}", unit,
+                                    s.drawing_hidden, s.drawing_dimensions))
+            self._record(job["rec"], "drawing", path)
+        with open(job["path"], "w", encoding="utf-8") as f:
+            f.write(drawing_svg(sheet_layout(views, s.drawing_projection), title, unit,
+                                s.drawing_hidden, s.drawing_dimensions))
+        self._record(job["rec"], "drawing", job["path"])
 
     def _job_turn_cameras(self, context, job):
         """transforms.json for a turntable. The product turns and the camera
@@ -5720,7 +6686,8 @@ class MV_OT_RenderAll(Operator):
             depth_exr = entry["files"].get("depth")
             if not rgb or not depth_exr or not file_ok(rgb) or not file_ok(depth_exr):
                 continue
-            record = camera_record(scene, cam)
+            record = camera_record(scene, cam, self._camera_matrix(scene, job["rec"]["label"],
+                                                                   entry["view"], cam))
             px = load_pixels(depth_exr, raw=True)[::-1]
             hit = px[..., 3] > 0.5
             depth_mm = np.where(hit, px[..., 0] / scale * units_mm, 0.0)
@@ -5997,7 +6964,7 @@ class MV_OT_RenderAll(Operator):
             "sheet": self._job_sheet, "turn_frame": self._job_turn_frame,
             "turn_encode": self._job_turn_encode, "cameras": self._job_cameras,
             "turn_cameras": self._job_turn_cameras, "bop": self._job_bop,
-            "coco": self._job_coco,
+            "coco": self._job_coco, "drawing": self._job_drawing,
         }[job["kind"]]
         try:
             handler(context, job)
@@ -6023,13 +6990,29 @@ class MV_OT_RenderAll(Operator):
             text += f"  ~{format_duration(self._render_time / self._renders_done * left)} left"
         return text + "  -  Esc to cancel"
 
+    def _hash(self, path):
+        """sha256 of a source file, once per run, or "" if it cannot be read."""
+        path = bpy.path.abspath(path or "")
+        if not path:
+            return ""
+        if path not in self._hashes:
+            self._hashes[path] = file_sha256(path) if os.path.isfile(path) else ""
+        return self._hashes[path]
+
     def _write_manifest(self, context):
-        fmt = context.scene.mv_settings.manifest_format
+        s = context.scene.mv_settings
+        fmt = s.manifest_format
+        # Croissant describes the dataset through the CSV manifest.
+        if s.export_croissant:
+            fmt = {'NONE': 'CSV', 'JSON': 'BOTH'}.get(fmt, fmt)
         if fmt == 'NONE' or not self._records:
             return
+        name = "manifest" + s.shard_suffix
         try:
-            write_manifest(self._out_root, self._records, self._labels, fmt,
-                           "manifest" + context.scene.mv_settings.shard_suffix)
+            write_manifest(self._out_root, self._records, self._labels, fmt, name,
+                           provenance(context, self._started_at))
+            if s.export_croissant and not s.shard_suffix:
+                write_croissant(self._out_root, name, croissant_meta(s))
         except (OSError, ValueError) as exc:
             self._notes.append(f"Manifest not written: {exc}.")
 
@@ -6412,10 +7395,25 @@ class MV_PT_Cameras(Panel):
     def draw(self, context):
         layout = self.layout
         s = context.scene.mv_settings
-        layout.prop(s, "view_set")
+        layout.prop(s, "view_protocol")
+        spec = VIEW_PROTOCOLS.get(s.view_protocol)
+        if spec:
+            box = layout.box()
+            col = box.column(align=True)
+            col.label(text=f"{len(protocol_views(s))} perspective views"
+                      + (f", {spec['fov']:g} deg FOV" if "fov" in spec else ""), icon='INFO')
+            if any(r for _, _, r in protocol_views(s)):
+                col.label(text="Distances in object sizes x Target Size.")
+                col.label(text="Published numbers: Fit Each, Target 1.0.")
+            if spec.get("random"):
+                box.prop(s, "protocol_seed")
 
         # A preset is drawn from VIEW_SETS, not from the checkboxes, because
         # that is what build_cameras reads for it. Only Custom edits them.
+        views_col = layout.column()
+        views_col.active = spec is None
+        layout = views_col
+        layout.prop(s, "view_set")
         custom = s.view_set == 'CUSTOM'
         preset = set() if custom else {v[0] for v in VIEW_SETS[s.view_set]}
         ortho = layout.grid_flow(row_major=True, columns=3, even_columns=True, align=True)
@@ -6433,11 +7431,14 @@ class MV_PT_Cameras(Panel):
                 cell.label(text=text,
                            icon='CHECKBOX_HLT' if name in preset else 'CHECKBOX_DEHLT')
 
+        layout = self.layout
         layout.prop(s, "front_axis")
         layout.prop(s, "frame_padding_factor")
 
-        layout.label(text="Custom Views (direction from target):")
-        row = layout.row()
+        col = layout.column()
+        col.active = spec is None
+        col.label(text="Custom Views (direction from target):")
+        row = col.row()
         row.template_list("MV_UL_CustomViews", "", s, "custom_views", s, "custom_views_index", rows=2)
         row.column(align=True).operator("mv.add_custom_view", text="", icon='ADD')
 
@@ -6760,13 +7761,73 @@ class MV_PT_RenderAnnotations(_RenderSubPanel, Panel):
             layout.label(text="Needs the Cycles add-on.", icon='ERROR')
 
 
+class MV_PT_RenderDrawings(_RenderSubPanel, Panel):
+    bl_label = "Drawings"
+
+    def draw_header(self, context):
+        self.layout.prop(context.scene.mv_settings, "export_drawings", text="")
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.mv_settings
+        layout.active = s.export_drawings
+        layout.row(align=True).prop(s, "drawing_projection", expand=True)
+        layout.prop(s, "drawing_crease")
+        row = layout.row(align=True)
+        row.prop(s, "drawing_hidden", toggle=True)
+        row.prop(s, "drawing_dimensions", toggle=True)
+        layout.prop(s, "drawing_resolution")
+        layout.label(text="SVG at 1:1 in source units.", icon='INFO')
+
+
+class MV_PT_RenderRandomize(_RenderSubPanel, Panel):
+    bl_label = "Randomize"
+
+    def draw_header(self, context):
+        self.layout.prop(context.scene.mv_settings, "random_enabled", text="")
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.mv_settings
+        layout.active = s.random_enabled
+        layout.prop(s, "random_seed")
+        col = layout.column(align=True)
+        col.prop(s, "random_camera_angle")
+        col.prop(s, "random_camera_distance")
+        layout.prop(s, "random_lights")
+        col = layout.column(align=True)
+        col.active = s.random_lights
+        col.prop(s, "random_light_yaw")
+        col.prop(s, "random_light_energy")
+        layout.prop(s, "random_hdri")
+        col = layout.column(align=True)
+        col.active = s.random_hdri
+        col.prop(s, "random_hdri_folder", text="")
+        row = col.row(align=True)
+        row.prop(s, "random_hdri_min", text="Min")
+        row.prop(s, "random_hdri_max", text="Max")
+        layout.prop(s, "random_material")
+        layout.prop(s, "random_distractors")
+        layout.label(text="Masks and annotations stay exact.", icon='INFO')
+
+
 class MV_PT_RenderManifest(_RenderSubPanel, Panel):
     bl_label = "Manifest"
 
     def draw(self, context):
         layout = self.layout
-        layout.prop(context.scene.mv_settings, "manifest_format", text="Write")
-        layout.label(text="Saved in the output directory.", icon='INFO')
+        s = context.scene.mv_settings
+        layout.prop(s, "manifest_format", text="Write")
+        layout.label(text="Saved in the output directory, with", icon='INFO')
+        layout.label(text="the settings and source file hashes.")
+        layout.prop(s, "export_croissant", text="Croissant (croissant.json)")
+        col = layout.column()
+        col.active = s.export_croissant
+        col.prop(s, "dataset_name")
+        col.prop(s, "dataset_description")
+        col.prop(s, "dataset_license")
+        col.prop(s, "dataset_url")
+        col.prop(s, "dataset_cite")
 
 
 classes = (
@@ -6818,6 +7879,8 @@ classes = (
     MV_PT_RenderPasses,
     MV_PT_RenderPost,
     MV_PT_RenderAnnotations,
+    MV_PT_RenderDrawings,
+    MV_PT_RenderRandomize,
     MV_PT_RenderManifest,
 )
 
