@@ -1,4 +1,4 @@
-# MultiView Product Renderer
+# CADshot
 
 A Blender add-on for turning CAD products into consistent, batch-rendered image sets.
 
@@ -7,9 +7,50 @@ orthographic and perspective cameras plus studio lighting, then render every pro
 every view in one click, with predictable file names like `AA_01_Widget_Front_clay.png`.
 
 - **Blender:** 4.0 and newer
-- **Panel location:** `3D Viewport → Sidebar (N key) → MultiView`
-- **Version:** 1.12.0
+- **Panel location:** `3D Viewport → Sidebar (N key) → CADshot`
+- **Version:** 1.13.0
 - **Cite:** see [`CITATION.cff`](CITATION.cff)
+- Formerly *MultiView Product Renderer*. The add-on folder, the collections it makes
+  (`MV_Products`, `MV_Cameras`, ...) and its operator names still carry the `MV` prefix, so
+  files and job files written before the rename open unchanged.
+
+---
+
+## Three parts
+
+CADshot makes three kinds of image set, and the sidebar shows one at a time. The **Part**
+switcher at the top of the panel picks which, and every panel below it appears only if that
+part uses it — so you never scroll past a texture control while rendering clay, or a camera
+control while rendering swatches.
+
+| Part | What it writes | About |
+| --- | --- | --- |
+| **Clay** | Every product from every view, as clay: `AA_01_Widget_Front_clay.png` | Form |
+| **Patches** | One image per pool material: a flat swatch beside a lit ball, in `materials/` | CMF |
+| **Variants** | Every product from every view, several times over, each in a different draw of textures: `AA_01_Widget_Front_v01.png` | CMF × Form |
+
+Each part needs a different half of the tool, which is what the switcher is for:
+
+```
+Clay        Products · Standardize · Views · Stage · Output
+Patches                      Texture Pool · Patch · Output
+Variants    Products · Standardize · Views · Stage ·
+            Texture Pool · Variants · Output
+```
+
+Patches need no product, no camera and no lighting: they are rendered in a scene of their
+own and yours is left exactly as it was. Clay needs no lighting either, because Workbench
+draws it with its own studio light and the ground is left out of it — so the Stage panel
+shows only the background until something in the run is actually lit by the scene.
+
+Picking a part sets the render mode and the variant count to match. It does not lock them:
+Clay's **Output** panel still offers `Clay / Full / Both`, so a form view in the product's
+own CAD colours is a tick away.
+
+Everything a dataset needs and a picture does not — camera poses, depth, normals, part IDs,
+COCO, BOP, vector drawings, seeded randomization, the provenance manifest and Croissant
+metadata — lives in one collapsed **Dataset & research** section at the bottom, in every
+part. See [Annotations for research](#annotations-for-research).
 
 ---
 
@@ -23,8 +64,8 @@ every view in one click, with predictable file names like `AA_01_Widget_Front_cl
    - Blender **4.2+**: `Install from Disk...` (in the top-right dropdown menu)
    - Blender **4.0 / 4.1**: `Install...`
 3. Pick the zip you downloaded. **Do not unzip it first.**
-4. Tick the checkbox next to **MultiView Product Renderer** to enable it.
-5. Press `N` in the 3D viewport and open the **MultiView** tab.
+4. Tick the checkbox next to **CADshot** to enable it.
+5. Press `N` in the 3D viewport and open the **CADshot** tab.
 
 ### Option B: clone the repo
 
@@ -62,10 +103,9 @@ batch render and file naming.
 | IGES (`.iges`, `.igs`) | FreeCAD | |
 | STL, PLY | Blender | Read as Z-up, which is what CAD writes |
 | OBJ, glTF / GLB, FBX | Blender | Up axis converted the way the format defines it. Cameras and lights in the file are dropped |
-| 3MF | MultiView's own reader | Meshes, components, build transforms and base-material colours. Blender has no 3MF importer |
+| 3MF | CADshot's own reader | Meshes, components, build transforms and base-material colours. Blender has no 3MF importer |
 
-Open `Edit → Preferences → Add-ons → MultiView Product Renderer` and expand the
-preferences:
+Open `Edit → Preferences → Add-ons → CADshot` and expand the preferences:
 
 | Setting | What it does |
 | --- | --- |
@@ -91,20 +131,206 @@ way the CAD file names it (`Housing`, `Lid`, `Screw`...), all inside the one pro
 collection. Colours set in the CAD file become materials (`MV_Color_RRGGBB`), including
 faces coloured differently from the rest of their part, and show in Full renders unless a
 material preset replaces them. FreeCAD's console mode cannot read STEP colours itself, so
-MultiView reads them from the file and passes them along. It understands the usual ways CAD
+CADshot reads them from the file and passes them along. It understands the usual ways CAD
 programs write colour; a file that colours parts some other way imports in grey, never
 fails.
 
-**STEPper route**: if you own the STEPper add-on, install and enable it; MultiView detects
+**STEPper route**: if you own the STEPper add-on, install and enable it; CADshot detects
 and uses its import operator automatically.
 
 ---
 
 ## Workflow
 
-The sidebar is laid out in the order you should use it.
+The sections below follow the panels down the sidebar. Which of them you see depends on the
+**Part** switcher at the top: Clay shows 1 to 4 and 6, Patches shows only 5 and 6, Variants
+shows all of them. See [Three parts](#three-parts).
 
-### 1. Scene Setup
+### 1. Products
+
+Add files to the list with **+**, or a whole folder with the folder button, then click
+**Import Files**. **Add Folder** picks up every supported file in the folder (tick **Include
+Subfolders** in the file browser's sidebar to go deeper, on by default) and skips files that
+are already in the list. Each file becomes its own collection under `MV_Products`. That
+grouping is what the batch renderer iterates over. You can mix formats freely in one list;
+each file is routed by its extension, and a file that fails does not stop the ones after it.
+
+Import runs in the background: the status bar shows `CADshot: 3/12 housing.step
+(converting)`, Blender stays responsive, and **Esc** cancels after the file in flight.
+Files that fail are skipped rather than stopping the batch, and FreeCAD's own error
+message is reported instead of a generic failure -- run `Window > Toggle System Console`
+to see the full list.
+
+Mesh files skip the conversion step entirely, so they land immediately rather than showing
+`(converting)`. A file that Blender cannot read is reported and skipped rather than
+becoming an empty product collection that would render as blank frames.
+
+**Mesh Units** says what unit the numbers in STL, OBJ, PLY, glTF and FBX files are in
+(millimetres by default, which is what CAD exports almost always use). It does not change
+the geometry; it is only used to report each product's real size and to scale products
+against each other with **Keep Proportions**. STEP and IGES come out of FreeCAD in
+millimetres, and 3MF files state their own unit.
+
+You can also click **Add Empty Product Collection** and drag existing meshes into it, which
+is how you use CADshot with geometry that didn't come from a CAD file.
+
+### 2. Standardize
+
+Everything that makes products comparable to each other lives in this panel.
+
+**Fit on Import** (on by default) does it automatically: as each file lands, the
+product is uniformly scaled so its largest dimension equals **Target Size** (default
+`1.0 m`, i.e. it fits inside a 1x1x1 m cube) and its bounding box is centred on the world
+origin. Turn it off if you want to place and scale products yourself.
+
+**Standardize Products** applies the same fit to everything already under `MV_Products`,
+which is what you want after dragging in your own meshes or importing with the option off:
+
+- **Recenter**: moves each product's bounding box centre onto the world origin. With
+  **Rest on Floor**, the bottom of the box goes on the origin instead, so the product stands
+  on the ground rather than straddling it.
+- **Rescale**: uniformly scales each product, one of two ways:
+  - **Fit Each** (default): every product's largest dimension becomes **Target Size**. This
+    is what makes a tiny screw and a large housing frame read identically in the final
+    images.
+  - **Keep Proportions**: the biggest product in the batch becomes Target Size and the rest
+    keep their real size relative to it, so a 10 mm screw next to a 400 mm housing renders
+    at a fortieth of its size. Uses the real sizes recorded at import, converted through
+    each file's units.
+
+Each product's real size, measured before anything rescaled it, is shown under the
+Standardize button for the active product (`120 x 40 x 15.5 mm`) and written to the
+manifest. Products assembled by hand are measured the first time Standardize runs on them,
+in metres.
+
+- **Auto Smooth**: fixes the faceted look a tessellated CAD import arrives with. FreeCAD
+  writes per-face normals that Blender keeps as custom split normals, and some Blender
+  versions also mark most edges sharp on import; either one pins the flat shading no matter
+  what you set. This clears both, then re-derives hard edges from the angle between faces
+  (**Smooth Angle**, default 30 degrees -- raise it to keep fewer hard edges, lower it to
+  keep more).
+
+Both operate on the product as one rigid assembly, so multi-part STEP files keep their
+parts in the right places relative to each other.
+
+Sharpness is baked into the mesh rather than left to a *Smooth by Angle* modifier, so a
+large batch costs nothing extra at render time. Running Standardize again is safe -- it is
+idempotent.
+
+Afterwards the transform is baked down: scale values read `1.0` and every object origin sits
+on the world origin, so the product rotates about its own centre and the N panel is clean.
+Geometry does not move during that step. Objects on multi-user or linked data cannot be
+edited by Blender, so those keep their transform and are counted in the status message.
+
+### 3. Views
+
+Choose a view set and click **Build Cameras**. Cameras land in `MV_Cameras`, named
+`MV_Cam_<View>`.
+
+| View set | Cameras |
+| --- | --- |
+| **All** | Front, Back, Top, Bottom, Right, Left + 3 perspectives (9) |
+| **Orthographic** | Front, Back, Top, Bottom, Right, Left (6) |
+| **Standard** | Front, Top, Right, Perspective (4) |
+| **Minimal** | Front, Top, Right (3) |
+| **Custom** | Whichever of the nine you tick |
+
+Under the dropdown is a checkbox for each of the nine views. With a preset selected they are
+greyed out and show what the preset includes. Pick **Custom** and they become editable,
+starting from the preset you had selected, so going from Standard to "Standard plus Back"
+takes one tick.
+
+**Front Axis** tells the add-on which world axis points out of the front of your product.
+CAD exports usually land on `+X` (the default); Blender's own convention is `-Y`. Getting
+this right is what makes the "Front" render actually the front.
+
+**Framing Padding** is the margin around the product in frame. `1.4` leaves 40% headroom
+on the tightest axis; `1.0` fits the product exactly to the frame edge. Framing accounts for
+your output resolution's aspect ratio, so a 16:9 or portrait render is not cropped.
+
+All orthographic views share one framing, and all perspective views share another, so a
+product reads at the same scale across the whole sheet rather than being re-fitted per view.
+
+Need an angle that isn't in the presets? Add a **Custom View** with an X/Y/Z direction
+vector and an ortho/perspective toggle, and it gets built alongside the rest. The checkbox at
+the start of its row switches it off without deleting it.
+
+#### Published protocols
+
+**Protocol** replaces the View Set with the camera rig of a published dataset or method, so
+a render set can match what a benchmark or model expects:
+
+| Protocol | Views | Field of view | Distance | Source |
+| --- | --- | --- | --- | --- |
+| **MVCNN, 12 views** | 12 around the product, 30 degrees apart, 30 degrees up | CADshot's | Shared framing | Su et al., ICCV 2015 |
+| **SyncDreamer, 16 views** | 16 around, 22.5 degrees apart, 30 degrees up | CADshot's | Shared framing | Liu et al., ICLR 2024 |
+| **Zero123++ v1.2, 6 views** | Azimuths 30, 90, ..., 330; elevations alternating 20 and -10 | 30 degrees | Shared framing | Shi et al., v1.2 README |
+| **MVDream, 4 views** | Front, right, back, left at 15 degrees up | 37.5 degrees | Shared framing | Shi et al., ICLR 2024 (middle of its random ranges) |
+| **Zero-1-to-3, 12 random views** | Uniform on the sphere, seeded | 49.1 degrees | 1.5-2.2 object sizes, seeded | Liu et al., ICCV 2023 |
+| **TRELLIS, 150 views** | Hammersley sequence on the sphere, seeded offset | 40 degrees | 2 object sizes | Xiang et al., CVPR 2025 |
+| **Catalogue, 15 degree plunge** | Front at 0 and 15 degrees; front-right, right, back, left, front-left at 15 | CADshot's | Shared framing | After the GS1 Product Image Specification's preferred plunge (names are CADshot's, not GS1 codes) |
+
+Azimuth 0 is the Front view, so protocols follow **Front Axis** like the built-in views.
+Distances given in object sizes assume the product is normalized into a unit cube, as these
+works do, and are multiplied by **Target Size**: with **Fit Each** and a Target Size of
+`1.0` they are the published numbers. Random protocols take a **Seed**, so the same rig can be
+built again exactly. MVDream samples its elevation and field of view at random; the preset
+fixes them at the middle of its ranges, and the paper should say so if it matters.
+
+#### Orient Products
+
+**Front Axis** fixes the whole batch at once, which only helps when every product was
+modelled the same way. In practice a few arrive facing the wrong way, and this is where you
+turn them by hand.
+
+**Isolate Active Product** (on by default) means you only ever see the one you are working
+on. Rotating or stepping hides the others, so a product is never obscured by the rest of the
+batch while you are trying to orient it. The checkbox applies the moment you tick it, and
+unticking it brings everything back.
+
+That is the same isolation a batch render uses, so what you see is what that product's
+render will contain. It is viewport state only: a batch render saves it, isolates each
+product in turn, and puts it back afterwards, so leaving it switched on never changes what
+gets rendered.
+
+**Previous** and **Next** step through the batch one product at a time. The list wraps, so
+you can keep pressing **Next** all the way round. **Show All** reveals every product and
+switches the checkbox off, so the next rotation does not immediately hide them again.
+
+**Left**, **Right**, **Up** and **Down** turn the product that is currently showing:
+
+| Button | What it does |
+| --- | --- |
+| **Left** / **Right** | Spins the product about the vertical axis. This is the turntable move that swings a sideways product round to face front. |
+| **Up** / **Down** | Tips the product about whatever axis is horizontal on your screen, for something lying on its back or standing on its nose. |
+
+Up and Down follow the camera, so they mean the same thing whichever view you are looking
+through. Rotation is about the product's own centre, so it never drifts out of frame, and a
+multi-part assembly turns as one rigid piece. **Rotate Step** sets how far one press turns
+it, 90 degrees by default, so four presses of the same button return to where you started.
+
+**Auto Orient** turns the product for you, and **All** next to it does the whole batch:
+
+| Method | What it does |
+| --- | --- |
+| **Lay Flat** (default) | Rests the product on its largest flat face, then turns it about the vertical so its footprint lines up with the axes and its longest side runs across the Front view. Right for boxes, housings, panels and most machined parts. |
+| **Principal Axes** | Lines the product's longest spread up across the Front view, the next longest towards the Front camera, and the thinnest upright. Better for rounded or organic shapes with no flat face. It may leave a product upside down; Up/Down twice fixes that. |
+
+**Reset** turns the product back to the way it faced when it was imported, undoing every
+Auto Orient and arrow press since; **All** resets the whole batch. A product you built by
+hand gets its starting orientation recorded the first time you turn it.
+
+Rotating a product changes the bounding box its framing was measured from, and framing is
+measured across the whole batch. With **Reframe Before Rendering** on (the default) you
+don't need to do anything about that: a render rebuilds the cameras before the first image.
+If you have switched it off, click **Build Cameras** again once you are done orienting.
+
+### 4. Stage
+
+Lighting, the ground and **Base Material** only appear when something in the run is lit by
+the scene — a Full render, or a Full-render turntable. Clay comes with Workbench's own studio
+light and leaves the ground out of the frame, so in the Clay part this panel shows the
+background alone. Switch Clay's **Shading** to Full or Both and the rest appears.
 
 Pick a lighting preset, a background and a ground, then **Apply Scene Setup**. This builds
 an `MV_Lighting` collection, an `MV_Stage` collection for the ground, and switches the scene
@@ -172,9 +398,9 @@ The ground is moved under each product as it is rendered, so short and tall prod
 stand on it. It is hidden for any view looking up from below it, so **Bottom** still shows
 the product.
 
-#### Materials
+#### Base Material
 
-The **Materials** sub-panel replaces the products' materials in Full renders with one of:
+The **Base Material** sub-panel replaces the products' materials in Full renders with one of:
 Matte Plastic, Glossy Plastic, Rubber, Brushed Metal, Polished Metal or Glass, in a colour
 you pick. **Keep Own** (the default) leaves materials alone.
 
@@ -186,9 +412,12 @@ The products' own materials are never edited. The preset is applied by a tempora
 Geometry Nodes modifier, `MV_Material`, added while the product renders and removed
 afterwards, so it also works on STL imports, which arrive with no materials at all.
 
-#### Material Pool
+### 5. Texture Pool
 
-The **Material Pool** sub-panel turns a folder of PBR texture sets into materials for
+Shown for the **Patches** and **Variants** parts, and the only panel Patches needs besides
+Output.
+
+The **Texture Pool** panel turns a folder of PBR texture sets into materials for
 your products. Point **Texture Folder** at a folder holding one sub-folder per material, as
 downloaded from [ambientCG](https://ambientcg.com) or [Poly Haven](https://polyhaven.com),
 and click the refresh button. Every folder with a colour map becomes a pool material:
@@ -229,6 +458,9 @@ is how much of the real part one repeat of a texture covers, in millimetres. A 1
 texture looks the same size on a 30 mm knob and a 2 m cabinet, whatever scale Fit on Import
 gave them. A product built by hand and never standardized is taken to be in metres.
 
+Texture Size belongs to the **Variants** part, which is why it only appears there: a patch
+shows one repeat filling its frame whatever size the real part would be.
+
 Normal maps are listed but not used, because they need the UVs these meshes do not have.
 Opacity maps are listed but not used either. Masks, part IDs and COCO/BOP annotations are
 made once per view, so a material that cut holes in the product would leave them wrong for
@@ -250,201 +482,46 @@ re-running gives the same variants. Adding variants, products or parts never cha
 other draws. Adding or unticking a pool material changes only the draws it wins or held.
 The pool's contents are recorded in the manifest's provenance block.
 
-**Material patches.** **Render Patches** writes one image per ticked material into
-`materials/` in the output folder. It shows a flat swatch, one repeat seen straight on, next
-to a ball under studio lights, with the material's name above. Tick **With Render All** to
-make them as part of every batch, listed in the manifest. In a sharded command-line run the
-first shard makes them, and rendering just the active product skips them. Patches render in
-a scene of their own with the scene's colour management, and the pool materials are deleted
-again after each run, so your scene is untouched. They use Cycles when your engine is
-Workbench, which cannot show textures.
+**Material patches.** Switch the **Part** to **Patches** and press **Render Material
+Patches** to write one image per ticked material into `materials/` in the output folder.
+Each shows a flat swatch, one repeat seen straight on, next to a ball under studio lights,
+with the material's name above. **Patch Size** is the pixel size of each half.
 
-### 2. Import Products
+Patches go through the same job queue as every other output, so they get the progress bar,
+the time left, Esc, Skip Existing and manifest rows of their own (`kind` is `patch`).
 
-Add files to the list with **+**, or a whole folder with the folder button, then click
-**Import Files**. **Add Folder** picks up every supported file in the folder (tick **Include
-Subfolders** in the file browser's sidebar to go deeper, on by default) and skips files that
-are already in the list. Each file becomes its own collection under `MV_Products`. That
-grouping is what the batch renderer iterates over. You can mix formats freely in one list;
-each file is routed by its extension, and a file that fails does not stop the ones after it.
+In the **Variants** part, **Render patches too** adds them to a variants run, so a texture
+dataset can ship its swatches beside its renders. In a sharded command-line run the first
+shard makes them, and rendering just the active product skips them.
 
-Import runs in the background: the status bar shows `MultiView: 3/12 housing.step
-(converting)`, Blender stays responsive, and **Esc** cancels after the file in flight.
-Files that fail are skipped rather than stopping the batch, and FreeCAD's own error
-message is reported instead of a generic failure -- run `Window > Toggle System Console`
-to see the full list.
+Patches render in a scene of their own with the scene's colour management, and the pool
+materials are deleted again after each run, so your scene is untouched. They use Cycles when
+your engine is Workbench, which cannot show textures — pre-flight stops the run if the
+Cycles add-on is switched off and the engine is Workbench, since there would be nothing to
+stand in with.
 
-Mesh files skip the conversion step entirely, so they land immediately rather than showing
-`(converting)`. A file that Blender cannot read is reported and skipped rather than
-becoming an empty product collection that would render as blank frames.
+### 6. Output
 
-**Mesh Units** says what unit the numbers in STL, OBJ, PLY, glTF and FBX files are in
-(millimetres by default, which is what CAD exports almost always use). It does not change
-the geometry; it is only used to report each product's real size and to scale products
-against each other with **Keep Proportions**. STEP and IGES come out of FreeCAD in
-millimetres, and 3MF files state their own unit.
+Set an **Output Directory** and press the render button, which is named after the part you
+are in: **Render Clay Views**, **Render Material Patches** or **Render Texture Variants**.
+**Active** beside it renders only the product selected in the Products list, whether it is
+ticked or not; the Patches part has no Active button, since patches belong to the pool
+rather than to any product.
 
-You can also click **Add Empty Product Collection** and drag existing meshes into it, which
-is how you use MultiView with geometry that didn't come from a CAD file.
+Whichever part is running, the batch is one job queue: the progress bar, the time left, Esc,
+Skip Existing and the manifest all behave the same way, patches included.
 
-### 3. Standardize
-
-Everything that makes products comparable to each other lives in this panel.
-
-**Fit on Import** (on by default) does it automatically: as each file lands, the
-product is uniformly scaled so its largest dimension equals **Target Size** (default
-`1.0 m`, i.e. it fits inside a 1x1x1 m cube) and its bounding box is centred on the world
-origin. Turn it off if you want to place and scale products yourself.
-
-**Standardize Products** applies the same fit to everything already under `MV_Products`,
-which is what you want after dragging in your own meshes or importing with the option off:
-
-- **Recenter**: moves each product's bounding box centre onto the world origin. With
-  **Rest on Floor**, the bottom of the box goes on the origin instead, so the product stands
-  on the ground rather than straddling it.
-- **Rescale**: uniformly scales each product, one of two ways:
-  - **Fit Each** (default): every product's largest dimension becomes **Target Size**. This
-    is what makes a tiny screw and a large housing frame read identically in the final
-    images.
-  - **Keep Proportions**: the biggest product in the batch becomes Target Size and the rest
-    keep their real size relative to it, so a 10 mm screw next to a 400 mm housing renders
-    at a fortieth of its size. Uses the real sizes recorded at import, converted through
-    each file's units.
-
-Each product's real size, measured before anything rescaled it, is shown under the
-Standardize button for the active product (`120 x 40 x 15.5 mm`) and written to the
-manifest. Products assembled by hand are measured the first time Standardize runs on them,
-in metres.
-
-- **Auto Smooth**: fixes the faceted look a tessellated CAD import arrives with. FreeCAD
-  writes per-face normals that Blender keeps as custom split normals, and some Blender
-  versions also mark most edges sharp on import; either one pins the flat shading no matter
-  what you set. This clears both, then re-derives hard edges from the angle between faces
-  (**Smooth Angle**, default 30 degrees -- raise it to keep fewer hard edges, lower it to
-  keep more).
-
-Both operate on the product as one rigid assembly, so multi-part STEP files keep their
-parts in the right places relative to each other.
-
-Sharpness is baked into the mesh rather than left to a *Smooth by Angle* modifier, so a
-large batch costs nothing extra at render time. Running Standardize again is safe -- it is
-idempotent.
-
-Afterwards the transform is baked down: scale values read `1.0` and every object origin sits
-on the world origin, so the product rotates about its own centre and the N panel is clean.
-Geometry does not move during that step. Objects on multi-user or linked data cannot be
-edited by Blender, so those keep their transform and are counted in the status message.
-
-### 4. Cameras / Views
-
-Choose a view set and click **Build Cameras**. Cameras land in `MV_Cameras`, named
-`MV_Cam_<View>`.
-
-| View set | Cameras |
-| --- | --- |
-| **All** | Front, Back, Top, Bottom, Right, Left + 3 perspectives (9) |
-| **Orthographic** | Front, Back, Top, Bottom, Right, Left (6) |
-| **Standard** | Front, Top, Right, Perspective (4) |
-| **Minimal** | Front, Top, Right (3) |
-| **Custom** | Whichever of the nine you tick |
-
-Under the dropdown is a checkbox for each of the nine views. With a preset selected they are
-greyed out and show what the preset includes. Pick **Custom** and they become editable,
-starting from the preset you had selected, so going from Standard to "Standard plus Back"
-takes one tick.
-
-**Front Axis** tells the add-on which world axis points out of the front of your product.
-CAD exports usually land on `+X` (the default); Blender's own convention is `-Y`. Getting
-this right is what makes the "Front" render actually the front.
-
-**Framing Padding** is the margin around the product in frame. `1.4` leaves 40% headroom
-on the tightest axis; `1.0` fits the product exactly to the frame edge. Framing accounts for
-your output resolution's aspect ratio, so a 16:9 or portrait render is not cropped.
-
-All orthographic views share one framing, and all perspective views share another, so a
-product reads at the same scale across the whole sheet rather than being re-fitted per view.
-
-Need an angle that isn't in the presets? Add a **Custom View** with an X/Y/Z direction
-vector and an ortho/perspective toggle, and it gets built alongside the rest. The checkbox at
-the start of its row switches it off without deleting it.
-
-#### Published protocols
-
-**Protocol** replaces the View Set with the camera rig of a published dataset or method, so
-a render set can match what a benchmark or model expects:
-
-| Protocol | Views | Field of view | Distance | Source |
-| --- | --- | --- | --- | --- |
-| **MVCNN, 12 views** | 12 around the product, 30 degrees apart, 30 degrees up | MultiView's | Shared framing | Su et al., ICCV 2015 |
-| **SyncDreamer, 16 views** | 16 around, 22.5 degrees apart, 30 degrees up | MultiView's | Shared framing | Liu et al., ICLR 2024 |
-| **Zero123++ v1.2, 6 views** | Azimuths 30, 90, ..., 330; elevations alternating 20 and -10 | 30 degrees | Shared framing | Shi et al., v1.2 README |
-| **MVDream, 4 views** | Front, right, back, left at 15 degrees up | 37.5 degrees | Shared framing | Shi et al., ICLR 2024 (middle of its random ranges) |
-| **Zero-1-to-3, 12 random views** | Uniform on the sphere, seeded | 49.1 degrees | 1.5-2.2 object sizes, seeded | Liu et al., ICCV 2023 |
-| **TRELLIS, 150 views** | Hammersley sequence on the sphere, seeded offset | 40 degrees | 2 object sizes | Xiang et al., CVPR 2025 |
-| **Catalogue, 15 degree plunge** | Front at 0 and 15 degrees; front-right, right, back, left, front-left at 15 | MultiView's | Shared framing | After the GS1 Product Image Specification's preferred plunge (names are MultiView's, not GS1 codes) |
-
-Azimuth 0 is the Front view, so protocols follow **Front Axis** like the built-in views.
-Distances given in object sizes assume the product is normalized into a unit cube, as these
-works do, and are multiplied by **Target Size**: with **Fit Each** and a Target Size of
-`1.0` they are the published numbers. Random protocols take a **Seed**, so the same rig can be
-built again exactly. MVDream samples its elevation and field of view at random; the preset
-fixes them at the middle of its ranges, and the paper should say so if it matters.
-
-#### Orient Products
-
-**Front Axis** fixes the whole batch at once, which only helps when every product was
-modelled the same way. In practice a few arrive facing the wrong way, and this is where you
-turn them by hand.
-
-**Isolate Active Product** (on by default) means you only ever see the one you are working
-on. Rotating or stepping hides the others, so a product is never obscured by the rest of the
-batch while you are trying to orient it. The checkbox applies the moment you tick it, and
-unticking it brings everything back.
-
-That is the same isolation **Render All** uses, so what you see is what that product's
-render will contain. It is viewport state only: a batch render saves it, isolates each
-product in turn, and puts it back afterwards, so leaving it switched on never changes what
-gets rendered.
-
-**Previous** and **Next** step through the batch one product at a time. The list wraps, so
-you can keep pressing **Next** all the way round. **Show All** reveals every product and
-switches the checkbox off, so the next rotation does not immediately hide them again.
-
-**Left**, **Right**, **Up** and **Down** turn the product that is currently showing:
-
-| Button | What it does |
-| --- | --- |
-| **Left** / **Right** | Spins the product about the vertical axis. This is the turntable move that swings a sideways product round to face front. |
-| **Up** / **Down** | Tips the product about whatever axis is horizontal on your screen, for something lying on its back or standing on its nose. |
-
-Up and Down follow the camera, so they mean the same thing whichever view you are looking
-through. Rotation is about the product's own centre, so it never drifts out of frame, and a
-multi-part assembly turns as one rigid piece. **Rotate Step** sets how far one press turns
-it, 90 degrees by default, so four presses of the same button return to where you started.
-
-**Auto Orient** turns the product for you, and **All** next to it does the whole batch:
-
-| Method | What it does |
-| --- | --- |
-| **Lay Flat** (default) | Rests the product on its largest flat face, then turns it about the vertical so its footprint lines up with the axes and its longest side runs across the Front view. Right for boxes, housings, panels and most machined parts. |
-| **Principal Axes** | Lines the product's longest spread up across the Front view, the next longest towards the Front camera, and the thinnest upright. Better for rounded or organic shapes with no flat face. It may leave a product upside down; Up/Down twice fixes that. |
-
-**Reset** turns the product back to the way it faced when it was imported, undoing every
-Auto Orient and arrow press since; **All** resets the whole batch. A product you built by
-hand gets its starting orientation recorded the first time you turn it., and framing is measured across the whole batch.
-With **Reframe Before Rendering** on (the default) you don't need to do anything about that:
-Render All rebuilds the cameras before the first image. If you have switched it off, click
-**Build Cameras** again once you are done orienting.
-
-### 5. Batch Render
-
-Set an **Output Directory**, choose a **Render Mode**, and hit **Render All**.
+The **Clay** part also chooses its shading here, because a form view in the product's own
+CAD colours is the same kind of image set:
 
 | Render mode | Output |
 | --- | --- |
 | **Full Render** | Uses your current engine (Cycles/EEVEE) and materials. |
 | **Clay (Workbench)** | Fast single-colour clay pass with cavity shading. Default. |
 | **Both** | Writes a `_render` and a `_clay` image per view. |
+
+The **Variants** part is always a Full render, since textures are the point of it, and
+**Patches** has no shading choice at all.
 
 Every product is isolated in turn (all others excluded from the view layer), so nothing
 bleeds between shots.
@@ -466,9 +543,11 @@ and does not slow your Full render down.
 
 #### Pre-flight check
 
-The **Pre-flight** section under Batch Render looks for anything that would waste a render,
+The **Pre-flight** section under Output looks for anything that would waste a render,
 before any render time is spent. **Check Batch** runs it on demand; with **On Render** ticked
-(the default) it also runs when you press Render All.
+(the default) it also runs when you press the render button. What it checks depends on the
+part: the Patches part is not asked about products, cameras, views or lighting, because it
+uses none of them.
 
 | Severity | Found | One-click fix |
 | --- | --- | --- |
@@ -478,6 +557,8 @@ before any render time is spent. **Check Batch** runs it on demand; with **On Re
 | Error | No views selected, or no cameras with Reframe off | Build cameras |
 | Error | The file name template would give two images the same name | |
 | Error | AO pass on, but the Cycles add-on is off | |
+| Error | The texture pool is empty, or textures it uses have moved | |
+| Error | Patches with Workbench as the engine and the Cycles add-on off, so nothing can stand in for it | |
 | Warning | Output folder is `//` relative but the `.blend` was never saved, so `//` points nowhere useful | Save the file |
 | Warning | Output folder does not exist yet | Create it |
 | Warning | Cameras are out of date (Reframe off): a product was turned, scaled or added, or the views, padding or resolution changed since Build Cameras | Rebuild cameras |
@@ -490,8 +571,8 @@ before any render time is spent. **Check Batch** runs it on demand; with **On Re
 | Warning | Shadow Catcher with an engine other than Cycles; HDRI file missing | |
 
 Each issue is listed in the panel with the product it concerns, and a wrench button where
-there is a fix. Errors stop Render All with a message saying why. Warnings bring up a
-dialog listing them, with **Render Anyway** and **Cancel**. Called from a script, Render All
+there is a fix. Errors stop the render with a message saying why. Warnings bring up a
+dialog listing them, with **Render Anyway** and **Cancel**. Called from a script, a render
 stops on errors the same way but never asks; warnings are left for the panel.
 
 Normals are checked by looking at every edge: two faces sharing an edge should run along it
@@ -505,7 +586,7 @@ The batch runs one image at a time with Blender still responsive. The status bar
 far it has got, which image is next, and roughly how long is left:
 
 ```
-MultiView: 12/90  AA_03_Bracket Top  ~4m 10s left  -  Esc to cancel
+CADshot: 12/90  AA_03_Bracket Top  ~4m 10s left  -  Esc to cancel
 ```
 
 **Esc** stops the batch after the image currently rendering. The time left is an average of
@@ -514,12 +595,15 @@ system console as it is written.
 
 #### Choosing what to render
 
-The **Products to render** list shows every product under `MV_Products` with the label its
-files will get. Untick a product to leave it out. The two buttons beside the list tick or
-untick all of them, and the main button changes to **Render N Ticked** when some are off.
+The **Render these** list in the **Products** panel shows every product under `MV_Products`
+with the label its files will get. Untick a product to leave it out. The two buttons beside
+the list tick or untick all of them, and the render button changes to **Render N Ticked**
+when some are off.
 
-**Render Active** renders only the product selected in the list, whether it is ticked or
-not. Clicking a row also makes it the product **Orient Products** works on.
+**Active**, beside the render button, renders only the product selected in that list,
+whether it is ticked or not. Clicking a row also makes it the product **Orient Products**
+works on, and in the Variants part its own material choice appears under the list —
+**Keep Own** there leaves a product out of the texture draw.
 
 Leaving a product out never renumbers the rest. Labels come from each product's place in the
 whole list, so `AA_03_Knob` is still `AA_03` when `AA_02` is unticked, and re-rendering one
@@ -567,7 +651,7 @@ Objects you have already switched off for rendering are not listed, so a deliber
 or staging rig does not keep setting the warning off.
 
 **Render engine, sample count, resolution, and file format stay in Blender's own Output and
-Render Properties.** MultiView only drives cameras, visibility, and file paths. It never
+Render Properties.** CADshot only drives cameras, visibility, and file paths. It never
 overwrites your render settings, and the clay pass restores your engine when it finishes.
 
 #### File naming
@@ -611,7 +695,7 @@ change it with tokens:
 | `{product}` | `Widget` | The product collection's name |
 | `{view}` | `Front` | The camera view, or `Sheet` / `Turntable` |
 | `{mode}` | `clay` | `clay`, `render` (Both mode), or empty for Full Render |
-| `{variant}` | `v01` | The Material Pool variant, empty for everything rendered once |
+| `{variant}` | `v01` | The Texture Pool variant, empty for everything rendered once |
 
 The defaults are `{label}_{product}` for the folder and `{label}_{product}_{view}_{mode}` for
 the file. A token that comes out empty takes one separator next to it along with it, so
@@ -624,7 +708,7 @@ the file. A token that comes out empty takes one separator next to it along with
   fields (the first image of the batch, as it will be written) instead of silently vanishing.
 - If the template would give two images the same name (no `{view}`, or no `{mode}` in Both
   mode), the render stops before it starts and says so.
-- With Material Pool variants on, a file name template without `{variant}` gets `_{variant}`
+- With Texture Pool variants on, a file name template without `{variant}` gets `_{variant}`
   added at the end, unless the folder template has `{variant}`, e.g.
   `{label}_{product}/{variant}`, which gives each variant a folder of its own.
 
@@ -691,7 +775,7 @@ output directory, listing every output with:
 
 `label`, `product`, `kind` (render, processed, sheet, turntable, patch, ...), `view`, `mode`,
 `path` (relative to the output directory), `width`, `height`, `source_file`, `source_size`,
-`source_units`, `source_sha256`, `variant` and `materials` (see Material Pool).
+`source_units`, `source_sha256`, `variant` and `materials` (see Texture Pool).
 
 `source_file`, `source_size` and `source_units` are recorded when a file is imported:
 `source_size` is the product's bounding box before Fit on Import rescaled it, in
@@ -705,7 +789,7 @@ since been deleted are dropped.
 
 Every row also carries `source_sha256`, the SHA-256 hash of the file it was rendered from.
 `manifest.json` opens with a `provenance` block holding enough to make the output again:
-- MultiView's version, repository and citation
+- CADshot's version, repository and citation
 - the Blender version and the `.blend` file
 - render engine, samples, resolution, file format and view transform
 - start and finish times
@@ -717,7 +801,7 @@ description of the output as a dataset, which the NeurIPS datasets track asks fo
 - The manifest CSV is its record set, one field per column, with its checksum.
 - Each file type in the output (PNG, EXR, SVG, ...) is a file set.
 - Name, description, licence, URL and citation come from the fields under the checkbox.
-  Without a citation, the dataset cites MultiView itself.
+  Without a citation, the dataset cites CADshot itself.
 - The Responsible AI fields are filled with what the tool knows for certain: synthetic
   renders of the listed files, no personal data. Intended use and limitations are left for
   you to add.
@@ -729,7 +813,7 @@ command-line run, `--merge` writes `croissant.json` for the merged whole.
 
 #### Annotations for research
 
-The **Annotations** section under Batch Render turns a render into a dataset. Everything
+The **Annotations** section under Dataset & research turns a render into a dataset. Everything
 here is computed from the same fixed camera rig as the images, so it lines up with them to
 the pixel. The test suite checks the camera numbers against Blender's own projection and the
 depth against ray casts.
@@ -759,7 +843,7 @@ on a contact sheet.
   instead, since no K describes them.
 - `width`, `height`, `clip`, and the relative paths of every image of that view.
 - `model_to_world`: the 4x4 matrix from the product's **source file coordinates** (in
-  `source_units`) to the scene. MultiView records every move it makes to a product (fitting,
+  `source_units`) to the scene. CADshot records every move it makes to a product (fitting,
   recentring, turning, Auto Orient), so a pixel in any render can be traced back to a point
   in the original CAD file. Moves you make by hand in the viewport are not seen.
 
@@ -782,7 +866,7 @@ separate SVGs (`AA_01_Widget_Front_drawing.svg`, ...), and all three on one shee
 (`AA_01_Widget_Drawing.svg`).
 
 - **True scale.** One SVG unit is one millimetre of the original part: a 120 mm housing
-  is drawn 120 mm wide at 1:1, whatever Target Size it was rendered at. MultiView takes back
+  is drawn 120 mm wide at 1:1, whatever Target Size it was rendered at. CADshot takes back
   out every scale it applied.
 - **Hidden lines dashed.** Lines are the mesh's feature edges, found geometrically: creases
   sharper than **Crease Angle**, silhouettes and open boundaries. Each is then tested
@@ -810,7 +894,7 @@ a faithful outline, not a finished drawing.
 | **Camera Jitter**, **Distance Jitter** | Each view's camera swings up to this far off its canonical direction, and moves nearer or farther |
 | **Lights** | The rig turns about the vertical by up to **Light Turn**, and each light changes strength by up to **Light Strength** |
 | **HDRI** | Each image is lit and backed by a random HDRI from **HDRI Folder** (empty: the studio HDRIs that ship with Blender), turned and scaled at random |
-| **Materials** | The product gets a random material preset and colour per image, in Full renders (not when Material Pool variants are on, which choose the materials instead) |
+| **Materials** | The product gets a random material preset and colour per image, in Full renders (not when Texture Pool variants are on, which choose the materials instead) |
 | **Distractors** | Random shapes in random colours, placed behind the product as each camera sees it, in Full renders |
 
 Every draw comes from the **Seed**, the product's label and the view, so the same settings
@@ -868,6 +952,14 @@ in. A job is JSON or TOML, and relative paths in it are relative to the job file
 | `render` | `engine`, `samples`, `device`, `resolution`, `percentage`, `file_format` |
 | `save_blend` | Save the set-up scene afterwards, to open and inspect in Blender |
 
+`part` is one of those settings: `"part": "PATCHES"` renders the material patches of the
+pool and nothing else, needing no `inputs` at all. Setting a part also sets `render_mode`,
+`pool_variants` and `pool_patches` to match, so if a job names both, put `part` first:
+
+```json
+{ "output": "swatches/", "settings": { "part": "PATCHES", "pool_folder": "textures/" } }
+```
+
 Other modes:
 
 - `--check` imports and sets up, runs the pre-flight check, prints its findings and renders
@@ -904,22 +996,34 @@ products, and any other world in the file, are never touched.
 
 ## Troubleshooting
 
-**"No cameras. Build cameras first."**: run *Build Cameras* in the Cameras / Views panel, or
+**"No cameras. Build cameras first."**: run *Build Cameras* in the Views panel, or
 switch **Reframe Before Rendering** back on.
 
 **"No views selected."**: the view set is **Custom** with nothing ticked (and no enabled
 custom views). Tick at least one view.
 
-**"No products are ticked for rendering."**: tick products in the **Products to render**
-list, or use **Render Active** for the selected one.
+**"No products are ticked for rendering."**: tick products in the **Render these** list in
+the Products panel, or use **Active** for the selected one.
+
+**A panel I am looking for is not in the sidebar**: check the **Part** switcher at the top.
+Each part hides the panels it cannot use — Patches has no Products, Standardize, Views or
+Stage, and Clay has no Texture Pool or Variants. See [Three parts](#three-parts).
+
+**"The material pool is empty: scan a texture folder."**: the Patches and Variants parts
+need a **Texture Folder** with at least one sub-folder holding a colour map. Point it at the
+library and press the refresh button beside it.
+
+**Lighting and Ground are missing from Stage**: nothing in the run is lit by the scene.
+Clay uses Workbench's own studio light and leaves the ground out. Set Clay's **Shading** to
+Full or Both, or switch to the Variants part, and they come back.
 
 **A cancelled or crashed batch**: tick **Skip Existing** and render again. Only the images
 that are missing get rendered.
 
-**Renders come back blank, or with something unexpected in them**: check the warning above
-**Render All**. Anything outside `MV_Products` is rendered along with every product, and a
-large object near the origin can hide the product completely. Delete it, move it into a
-product collection, or turn off its render visibility.
+**Renders come back blank, or with something unexpected in them**: check the warning at the
+bottom of the Products panel. Anything outside `MV_Products` is rendered along with every
+product, and a large object near the origin can hide the product completely. Delete it, move
+it into a product collection, or turn off its render visibility.
 
 **"No product collections under 'MV_Products'."**: import a STEP or STL file, or add an empty
 product collection and put your meshes inside it. Meshes sitting loose in the scene
@@ -932,12 +1036,12 @@ to see the subprocess output.
 **Products are all different sizes in the renders**: run *Standardize Products* in the
 Standardize panel with **Rescale** enabled.
 
-**The "Front" view isn't the front**: change **Front Axis** in Cameras / Views and rebuild
+**The "Front" view isn't the front**: change **Front Axis** in Views and rebuild
 the cameras. If only some products are wrong, Front Axis will not help, because it moves the whole
 batch. Use *Orient Products* to turn the offenders individually, then rebuild.
 
 **Only one product is visible in the viewport**: **Isolate Active Product** is on, which is
-the default while orienting. Click **Show All** in Cameras / Views, or untick the box.
+the default while orienting. Click **Show All** under Views > Orient Products, or untick the box.
 Renders are unaffected either way.
 
 **Renders are cropped after rotating products**: rotating changes the bounding box the
