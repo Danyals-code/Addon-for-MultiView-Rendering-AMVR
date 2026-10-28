@@ -197,37 +197,50 @@ def body():
         # ---- patches
         scene.render.engine = 'BLENDER_WORKBENCH'
         scenes, objects = len(bpy.data.scenes), len(bpy.data.objects)
+        # Labels off, so the grid has no title or row gutter and every tile
+        # sits at an offset the test can work out for itself.
+        s.patch_labels = False
         patch = os.path.join(out, "patch.png")
         w, hgt = mv.render_patch(bpy.context, "Bricks_A", bricks, patch, 96)
         check("patch written", os.path.isfile(patch))
         px = mv.load_pixels(patch)
-        check("patch is two cells wide", px.shape[1] == w and w >= 2 * 96 and px.shape[0] == hgt,
-              px.shape)
+        gap = max(6, 96 // 32)
+        check("default patch is two tiles across and one lighting down",
+              px.shape[1] == w and px.shape[0] == hgt
+              and w == 2 * 96 + 3 * gap and hgt == 96 + 2 * gap,
+              (px.shape, w, hgt))
         check("patch scene and objects cleaned up", len(bpy.data.scenes) == scenes
               and len(bpy.data.objects) == objects and scene.render.engine == 'BLENDER_WORKBENCH')
-        # Each half of the sheet, without its white title and label margins.
-        top = px[::-1]
-        cells = []
-        for half in (top[:, :w // 2, :3], top[:, w // 2:, :3]):
-            inked = half.min(axis=2) < 0.85
-            cells.append(half[inked])
-        flat, ball = cells
-        flat_red = flat[:, 0] - flat[:, 2]
+
+        def tile(image, col):
+            """One tile of the top row, rows running top-down."""
+            top = image[::-1]
+            x = gap + col * (96 + gap)
+            return top[gap:gap + 96, x:x + 96, :3]
+
+        flat, ball = tile(px, 0), tile(px, 1)
+        flat_red = flat[..., 0] - flat[..., 2]
         check("flat swatch shows the red checker", (flat_red > 0.1).mean() > 0.95,
               float((flat_red > 0.1).mean()))
         check("flat swatch shows both checker tones",
-              np.percentile(flat[:, 0], 90) - np.percentile(flat[:, 0], 10) > 0.15)
-        ball_red = ball[:, 0] - ball[:, 2]
-        check("ball is red on a grey ground", 0.1 < (ball_red > 0.15).mean() < 0.6
-              and abs(np.median(ball_red)) < 0.05, float((ball_red > 0.15).mean()))
+              np.percentile(flat[..., 0], 90) - np.percentile(flat[..., 0], 10) > 0.15)
+        # The sphere is rendered on transparent film and composited onto the
+        # grid's white background, so the tile is a red ball surrounded by white.
+        subject = ball.min(axis=2) < 0.85
+        check("the sphere tile holds a red sphere on white",
+              0.3 < subject.mean() < 0.85
+              and float((ball[..., 0] - ball[..., 2])[subject].mean()) > 0.1,
+              (float(subject.mean()),
+               float((ball[..., 0] - ball[..., 2])[subject].mean())))
         # The scene's colour management carries over to the patch.
         scene.view_settings.exposure = -1.5
         mv.render_patch(bpy.context, "Bricks_A", bricks, os.path.join(out, "dark.png"), 96)
         scene.view_settings.exposure = 0.0
-        dark = mv.load_pixels(os.path.join(out, "dark.png"))[::-1]
-        dark_flat = dark[:, :w // 2, :3][dark[:, :w // 2, :3].min(axis=2) < 0.85]
-        check("patch follows the scene's exposure", dark_flat[:, 0].mean() < flat[:, 0].mean() - 0.1,
-              (float(dark_flat[:, 0].mean()), float(flat[:, 0].mean())))
+        dark_flat = tile(mv.load_pixels(os.path.join(out, "dark.png")), 0)
+        check("patch follows the scene's exposure",
+              dark_flat[..., 0].mean() < flat[..., 0].mean() - 0.1,
+              (float(dark_flat[..., 0].mean()), float(flat[..., 0].mean())))
+        s.patch_labels = True
 
         # ---- a two-part product
         coll, (block, peg) = h.add_product(

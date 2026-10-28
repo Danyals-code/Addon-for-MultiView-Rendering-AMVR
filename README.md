@@ -26,7 +26,7 @@ control while rendering swatches.
 | Part | What it writes | About |
 | --- | --- | --- |
 | **Clay** | Every product from every view, as clay: `AA_01_Widget_Front_clay.png` | Form |
-| **Patches** | One image per pool material: a flat swatch beside a lit ball, in `materials/` | CMF |
+| **Patches** | One image per pool material: a grid of the material on each ticked shape, under each ticked lighting condition, in `materials/` | CMF |
 | **Variants** | Every product from every view, several times over, each in a different draw of textures: `AA_01_Widget_Front_v01.png` | CMF × Form |
 
 Each part needs a different half of the tool, which is what the switcher is for:
@@ -484,21 +484,58 @@ The pool's contents are recorded in the manifest's provenance block.
 
 **Material patches.** Switch the **Part** to **Patches** and press **Render Material
 Patches** to write one image per ticked material into `materials/` in the output folder.
-Each shows a flat swatch, one repeat seen straight on, next to a ball under studio lights,
-with the material's name above. **Patch Size** is the pixel size of each half.
+Each image is a grid: the **shapes** you ticked across it, the **lighting conditions** you
+ticked down it.
+
+```
+                 Flat      Sphere     Cube
+  Studio Soft  [ tile ]  [ tile ]  [ tile ]
+  Studio Hard  [ tile ]  [ tile ]  [ tile ]
+  Dramatic     [ tile ]  [ tile ]  [ tile ]
+```
+
+Three shapes and three lighting conditions is nine tiles in one file per material. **Tile
+Size** is the pixel size of one tile, and **Labels** prints the material's name across the
+top, the shape names along it and the lighting names down the side.
+
+| Shape | What it shows |
+| --- | --- |
+| **Flat** | One repeat of the texture seen straight on, filling the tile: colour and pattern scale as authored. Orthographic, so there is no perspective to read around |
+| **Sphere** | Continuous curvature, one highlight, and the falloff to the terminator |
+| **Cube** | Three faces at once, so the box projection's seams show honestly rather than being hidden by a curve |
+| **Cylinder** | A sweep in one axis only, which is what most machined parts are |
+
+The solid shapes are all built to sit inside one sphere and share one three-quarter camera,
+so a shape fills as much of its tile as its own form allows and the texture reads at the same
+scale right across a row. The flat swatch gets a straight-on orthographic camera of its own.
+
+**Lighting conditions** are the same presets the **Stage** panel uses — the built-in four,
+plus any you saved there with **+**. Tick as many as you want; each becomes a row. The
+refresh button beside the list picks up presets you have saved since. *No Lights* is left
+out, since a patch scene has no HDRI and the swatch would come out black. With nothing
+ticked, one row is rendered under a built-in studio rig.
+
+A preset stores its positions and sizes as multiples of the subject's size, so it rebuilds
+around a patch shape with no extra work — which means **a swatch under Studio Soft is lit
+the way a product scaled to a Target Size of `1.0` is lit under Studio Soft**. The same
+**Intensity** applies. That is what makes a patch worth comparing against a render.
 
 Patches go through the same job queue as every other output, so they get the progress bar,
 the time left, Esc, Skip Existing and manifest rows of their own (`kind` is `patch`).
 
-In the **Variants** part, **Render patches too** adds them to a variants run, so a texture
-dataset can ship its swatches beside its renders. In a sharded command-line run the first
-shard makes them, and rendering just the active product skips them.
+Patches render in a scene of their own with the scene's colour management, on transparent
+film composited onto the grid's white background, and the pool materials are deleted again
+after each run, so your scene is untouched. They use Cycles when your engine is Workbench,
+which cannot show textures — pre-flight stops the run if the Cycles add-on is switched off
+and the engine is Workbench, since there would be nothing to stand in with.
 
-Patches render in a scene of their own with the scene's colour management, and the pool
-materials are deleted again after each run, so your scene is untouched. They use Cycles when
-your engine is Workbench, which cannot show textures — pre-flight stops the run if the
-Cycles add-on is switched off and the engine is Workbench, since there would be nothing to
-stand in with.
+Patches belong to the **Patches** part only; the Variants part is about textures on
+products. A command-line job can still set `pool_patches` to get both from one run, which is
+what a sharded dataset build wants:
+
+```json
+{ "settings": { "part": "VARIANTS", "pool_variants": 8, "pool_patches": true } }
+```
 
 ### 6. Output
 
@@ -559,6 +596,7 @@ uses none of them.
 | Error | AO pass on, but the Cycles add-on is off | |
 | Error | The texture pool is empty, or textures it uses have moved | |
 | Error | Patches with Workbench as the engine and the Cycles add-on off, so nothing can stand in for it | |
+| Warning | A ticked patch lighting condition whose saved preset can no longer be read, so that row is skipped | |
 | Warning | Output folder is `//` relative but the `.blend` was never saved, so `//` points nowhere useful | Save the file |
 | Warning | Output folder does not exist yet | Create it |
 | Warning | Cameras are out of date (Reframe off): a product was turned, scaled or added, or the views, padding or resolution changed since Build Cameras | Rebuild cameras |

@@ -222,6 +222,105 @@ def body():
         check("a product in the scene is not rendered by the Patches part",
               not any(d.startswith("AA_") for d in os.listdir(root)), os.listdir(root))
 
+        # ---- shapes and lighting conditions
+        check("switching to Patches listed the lighting presets",
+              [i.key for i in s.patch_lighting]
+              == [k for k, v in mv.LIGHTING_PRESETS.items() if v["lights"]],
+              [i.key for i in s.patch_lighting])
+        check("No Lights is left out, it would render black",
+              "NONE" not in {i.key for i in s.patch_lighting})
+        check("nothing ticked falls back to the built-in studio rig",
+              [label for label, _ in mv.patch_lightings(s)] == ["Studio"],
+              mv.patch_lightings(s))
+        s.patch_lighting[0].enabled = True
+        s.patch_lighting[1].enabled = True
+        mv.sync_patch_lighting(s)
+        check("a refresh keeps the ticks",
+              [i.enabled for i in s.patch_lighting][:2] == [True, True])
+        check("ticked presets become the rows",
+              len(mv.patch_lightings(s)) == 2, mv.patch_lightings(s))
+
+        s.patch_shapes = [True] * len(mv.PATCH_SHAPES)
+        check("every shape builds a mesh",
+              all(mv.patch_subject(k)[0].polygons for k, _, _ in mv.PATCH_SHAPES))
+        check("only the flat swatch asks for the straight-on camera",
+              [k for k, _, _ in mv.PATCH_SHAPES if mv.patch_subject(k)[1] is not None]
+              == ['FLAT'])
+
+        TILE = 64
+
+        def patch_once(shape_keys, labels=False, tag=""):
+            """Render one material. (result, grid pixels, how many tiles)."""
+            s.patch_labels = labels
+            s.patch_size = TILE
+            s.patch_shapes = [k in shape_keys for k, _, _ in mv.PATCH_SHAPES]
+            folder = os.path.join(out, "shape_" + "_".join(sorted(shape_keys)) + tag)
+            s.render_output_dir = folder + os.sep
+            r = h.run(bpy.ops.mv.render_all)
+            grid = os.path.join(folder, "materials", "Bricks_A_patch.png")
+            rows = max(1, sum(1 for i in s.patch_lighting if i.enabled))
+            px = mv.load_pixels(grid) if os.path.isfile(grid) else None
+            return r, px, len(shape_keys) * rows
+
+        def filled(px, tiles):
+            """How much of the tiles' own area is not the white background.
+
+            Measured against the tiles rather than the whole canvas, which
+            also carries gaps and, with labels on, a caption gutter.
+            """
+            lit = (np.abs(px[..., :3] - 1.0).max(axis=-1) > 0.08).sum()
+            return float(lit) / (tiles * TILE * TILE)
+
+        r, flat, flat_n = patch_once({'FLAT'})
+        check("a flat-only patch renders", r == {'FINISHED'} and flat is not None, r)
+        r, sphere, sphere_n = patch_once({'SPHERE'})
+        check("a sphere-only patch renders", r == {'FINISHED'} and sphere is not None, r)
+        if flat is not None and sphere is not None:
+            # One column, two lighting rows, so both grids are the same shape.
+            check("one shape and two lightings give a 1 x 2 grid",
+                  flat.shape == sphere.shape and flat.shape[1] < flat.shape[0],
+                  (flat.shape, sphere.shape))
+            check("the flat swatch fills its tile",
+                  filled(flat, flat_n) > 0.9, filled(flat, flat_n))
+            # A sphere inscribed in its tile covers pi/4; the padding takes a
+            # little more off, so anything well inside that range is in frame.
+            check("the sphere is in frame and reads as a sphere",
+                  0.45 < filled(sphere, sphere_n) < 0.8, filled(sphere, sphere_n))
+
+        r, wide, wide_n = patch_once({'FLAT', 'SPHERE', 'CUBE', 'CYLINDER'})
+        check("four shapes render", r == {'FINISHED'} and wide is not None, r)
+        if wide is not None and flat is not None:
+            check("more shapes make a wider grid, same height",
+                  wide.shape[1] > flat.shape[1] and wide.shape[0] == flat.shape[0],
+                  (wide.shape, flat.shape))
+            check("every shape sits well inside its tile",
+                  0.4 < filled(wide, wide_n) < 0.95, filled(wide, wide_n))
+
+        s.patch_lighting[1].enabled = False
+        r, short, short_n = patch_once({'FLAT'}, tag="_one")
+        if short is not None and flat is not None:
+            check("one fewer lighting makes a shorter grid",
+                  short.shape[0] < flat.shape[0], (short.shape, flat.shape))
+
+        r, labelled, _ = patch_once({'FLAT'}, labels=True, tag="_lab")
+        if labelled is not None and short is not None:
+            check("labels add a caption gutter and a title",
+                  labelled.shape[0] > short.shape[0]
+                  and labelled.shape[1] > short.shape[1],
+                  (labelled.shape, short.shape))
+
+        check("no patch scene or light is left behind",
+              not any(sc.name.startswith("MV_Patch") for sc in bpy.data.scenes)
+              and not any(o.name.startswith("MV_Patch") for o in bpy.data.objects)
+              and not any(l.name.startswith("MV_Patch") for l in bpy.data.lights),
+              [sc.name for sc in bpy.data.scenes])
+
+        s.patch_labels = True
+        s.patch_shapes = [k in {'FLAT', 'SPHERE'} for k, _, _ in mv.PATCH_SHAPES]
+        for item in s.patch_lighting:
+            item.enabled = False
+        s.render_output_dir = os.path.join(out, "patches") + os.sep
+
         # ---- and with no product in the scene at all
         bpy.data.collections.remove(coll)
         s.render_output_dir = os.path.join(out, "bare") + os.sep

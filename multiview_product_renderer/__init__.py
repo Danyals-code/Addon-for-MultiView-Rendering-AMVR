@@ -102,6 +102,49 @@ LIGHTING_PRESETS = {
 USER_PRESET_PREFIX = "USER:"
 LIGHT_RIG = "MV_LightRig"
 
+# -- material patches ----------------------------------------------------------
+#
+# A patch shows one material on several shapes, under several lighting
+# conditions, composited into one grid: shapes across, lighting down. Each
+# tile is rendered in a scene of its own, so nothing here touches the user's.
+#
+# The shapes are sized to sit inside a sphere of PATCH_EXTENT, and the lighting
+# comes from the same presets the Stage panel uses. Presets store positions and
+# sizes as multiples of the subject's size, so a one-unit patch subject takes
+# them as they are: a swatch under Studio Soft is lit the way a product scaled
+# to a Target Size of 1.0 is lit under Studio Soft.
+
+PATCH_SHAPES = [
+    ('FLAT', "Flat", "One repeat of the texture seen straight on, filling the tile: "
+                     "colour and pattern scale as authored"),
+    ('SPHERE', "Sphere", "Continuous curvature, one highlight and a falloff to the "
+                         "terminator"),
+    ('CUBE', "Cube", "Three faces at once, so the box projection's seams show honestly"),
+    ('CYLINDER', "Cylinder", "A sweep in one axis only, as most machined parts are"),
+]
+PATCH_SHAPE_LABELS = {k: label for k, label, _ in PATCH_SHAPES}
+# The diameter of the sphere every non-flat subject is built to sit inside, so
+# one camera frames them all identically and they can be compared tile to tile.
+PATCH_EXTENT = 0.9
+# Margin left around that sphere in its tile.
+PATCH_PADDING = 1.1
+
+# Where the patch camera stands for the solid shapes: a three-quarter view, so
+# a cube shows three faces. The flat swatch gets a straight-on orthographic
+# camera of its own instead. Looking from -Y matches the direction a lighting
+# preset is laid out against, so a preset's key light lands where it should.
+PATCH_VIEW_DIR = (0.62, -1.0, 0.52)
+# Enough ambient that an unlit side is not pure black; the lamps do the work.
+PATCH_WORLD_GREY = 0.18
+
+# Stands in when no lighting condition is ticked, and reproduces the patch
+# every version before this one rendered.
+PATCH_STUDIO = [
+    {"name": "Key", "type": 'AREA', "pos": (1.6, -1.6, 2.0), "size": 1.5, "energy": 250.0},
+    {"name": "Fill", "type": 'AREA', "pos": (-2.0, -1.2, 0.8), "size": 1.5, "energy": 70.0},
+    {"name": "Rim", "type": 'AREA', "pos": (0.0, 2.2, 1.8), "size": 1.5, "energy": 150.0},
+]
+
 MATERIAL_PRESETS = {
     "MATTE_PLASTIC":  {"label": "Matte Plastic",  "inputs": {"Roughness": 0.55}},
     "GLOSSY_PLASTIC": {"label": "Glossy Plastic", "inputs": {"Roughness": 0.12, "Coat Weight": 0.4}},
@@ -162,21 +205,29 @@ PART_GUIDES = {
     ],
     'PATCHES': [
         "Material patches: one image per material in the pool, a",
-        "flat swatch beside the same material on a lit ball.",
+        "grid of the shapes you tick across and the lighting",
+        "conditions you tick down.",
         "",
         "1. Texture Pool: point Texture Folder at a library with one",
         "   sub-folder per material, as downloaded from ambientCG or",
         "   Poly Haven, and click the refresh button. Every folder",
         "   with a colour map becomes a material. Untick any you do",
-        "   not want. Texture Size is how much of the real part one",
-        "   repeat covers, in millimetres.",
-        "2. Patch: set the size of each half in pixels.",
+        "   not want.",
+        "2. Patch: tick the shapes (flat swatch, sphere, cube,",
+        "   cylinder) and the lighting conditions. The lighting list",
+        "   is the same presets Stage uses, including any you saved",
+        "   there; refresh it to pick up new ones. Three shapes and",
+        "   three lightings is nine tiles in one image.",
         "3. Output: set the folder, then Render Material Patches.",
         "   They are written to materials/ inside it.",
         "",
-        "This part needs no product, no camera and no lighting:",
-        "patches are rendered in a scene of their own, and yours is",
-        "left exactly as it was.",
+        "A preset is stored relative to the subject's size, so a",
+        "swatch under Studio Soft is lit the way a product at a",
+        "Target Size of 1.0 is lit under Studio Soft.",
+        "",
+        "This part needs no product and no camera: patches are",
+        "rendered in a scene of their own, and yours is left exactly",
+        "as it was.",
     ],
     'VARIANTS': [
         "Texture variants: every product rendered several times",
@@ -466,6 +517,14 @@ class MV_PoolMaterial(PropertyGroup):
                         options={'HIDDEN'})
 
 
+class MV_PatchLight(PropertyGroup):
+    key: StringProperty(description="Lighting preset key, built-in or saved",
+                        options={'HIDDEN'})
+    name: StringProperty(name="Name")
+    enabled: BoolProperty(name="Use", default=False,
+                          description="Give the patch a row under this lighting")
+
+
 class MV_Issue(PropertyGroup):
     severity: StringProperty()
     message: StringProperty()
@@ -555,6 +614,9 @@ def _update_part(self, context):
     elif self.part == 'PATCHES':
         self.pool_patches = True
         self.pool_variants = 0
+        # The lighting list is built from presets on disk, so it is refreshed
+        # on the way in rather than left as another file or machine left it.
+        sync_patch_lighting(self)
     else:
         self.render_mode = 'FULL'
         self.pool_patches = False
@@ -732,12 +794,26 @@ class MV_Settings(PropertyGroup):
     )
     pool_patches: BoolProperty(
         name="Patches",
-        description="With Render All, also write one image per pool material: a flat "
-                    "swatch and a material ball side by side, in materials/",
+        description="With Render All, also write one image per pool material: the "
+                    "material on each ticked shape, under each ticked lighting "
+                    "condition, in materials/",
         default=False,
     )
-    patch_size: IntProperty(name="Patch Size", default=512, min=64, max=4096,
-                            description="Pixels per side of each half of a patch")
+    patch_size: IntProperty(name="Tile Size", default=512, min=64, max=4096,
+                            description="Pixels per side of each tile in a patch")
+    patch_shapes: BoolVectorProperty(
+        name="Shapes",
+        description="Which shapes the material is shown on, left to right across the patch",
+        size=len(PATCH_SHAPES),
+        default=tuple(k in {'FLAT', 'SPHERE'} for k, _, _ in PATCH_SHAPES),
+    )
+    patch_lighting: CollectionProperty(type=MV_PatchLight)
+    patch_lighting_index: IntProperty(default=0)
+    patch_labels: BoolProperty(
+        name="Labels", default=True,
+        description="Print the material's name across the top, the shapes along it and "
+                    "the lighting conditions down the side",
+    )
 
     render_output_dir: StringProperty(
         name="Output Directory", subtype='DIR_PATH', default="//renders/",
@@ -3593,14 +3669,217 @@ def apply_variant(settings, coll, assignment, entries):
             obj.update_tag()
 
 
+def patch_shape_keys(settings):
+    """[(key, label)] for the ticked patch shapes, in PATCH_SHAPES order.
+
+    Falls back to the flat swatch so a patch is never an empty grid; the
+    panel and pre-flight both say so before it comes to that.
+    """
+    found = [(k, label) for (k, label, _), on
+             in zip(PATCH_SHAPES, settings.patch_shapes) if on]
+    return found or [PATCH_SHAPES[0][:2]]
+
+
+def sync_patch_lighting(settings):
+    """Refresh the lighting list from the presets, keeping the ticks.
+
+    Built-ins first and saved ones after, the order the Stage dropdown shows
+    them in. 'No Lights (HDRI only)' is left out: a patch scene has no HDRI,
+    so it would render every swatch black.
+    """
+    ticks = {item.key: item.enabled for item in settings.patch_lighting}
+    settings.patch_lighting.clear()
+    available = [(k, v["label"]) for k, v in LIGHTING_PRESETS.items() if v["lights"]]
+    available += [(k, label) for k, (label, _) in sorted(user_lighting_presets().items())]
+    for key, label in available:
+        item = settings.patch_lighting.add()
+        item.key = key
+        item.name = label
+        item.enabled = ticks.get(key, False)
+    return len(settings.patch_lighting)
+
+
+def patch_lightings(settings):
+    """[(label, specs)] for the ticked lighting conditions.
+
+    With nothing ticked -- a fresh file, or a preset that has since been
+    deleted -- one row under the built-in studio rig, which is the patch
+    every version before lighting conditions existed rendered.
+    """
+    found = []
+    for item in settings.patch_lighting:
+        if not item.enabled:
+            continue
+        specs = lighting_specs(item.key)
+        if specs:
+            found.append((item.name, specs))
+    return found or [("Studio", PATCH_STUDIO)]
+
+
+def patch_subject(kind):
+    """(mesh, ortho scale or None) for one patch shape, centred on the origin.
+
+    An ortho scale means the shape wants the straight-on camera: only the flat
+    swatch does, so that one repeat of the texture fills its tile exactly.
+    Everything else is sized to sit inside PATCH_EXTENT and shares the
+    three-quarter camera, so the tiles of a row are framed alike.
+    """
+    import bmesh
+    if kind == 'FLAT':
+        mesh = bpy.data.meshes.new("MV_Patch_Flat")
+        mesh.from_pydata([(-0.5, -0.5, 0.0), (0.5, -0.5, 0.0),
+                          (0.5, 0.5, 0.0), (-0.5, 0.5, 0.0)], [], [(0, 1, 2, 3)])
+        mesh.update()
+        return mesh, 1.0
+
+    radius = PATCH_EXTENT * 0.5
+    bm = bmesh.new()
+    if kind == 'SPHERE':
+        bmesh.ops.create_uvsphere(bm, u_segments=96, v_segments=48, radius=radius)
+        smooth = bm.faces
+    elif kind == 'CUBE':
+        # A cube's diagonal is what has to fit, not its side.
+        bmesh.ops.create_cube(bm, size=PATCH_EXTENT / math.sqrt(3.0))
+        smooth = []
+    else:
+        # Sized so its own corner-to-centre distance still lands inside the
+        # shared bounding sphere: sqrt(r^2 + (d/2)^2) <= radius.
+        bmesh.ops.create_cone(bm, cap_ends=True, cap_tris=False, segments=64,
+                              radius1=radius * 0.66, radius2=radius * 0.66,
+                              depth=PATCH_EXTENT * 0.72)
+        # The caps are flat and the wall is round: smoothing both together
+        # would bend the rim and lose the edge the highlight runs along.
+        # Chosen here, while the axis is still Z and the caps are the only
+        # faces pointing along it.
+        smooth = [f for f in bm.faces if abs(f.normal.z) < 0.9]
+    for face in smooth:
+        face.smooth = True
+    if kind == 'CYLINDER':
+        # Laid on its side. Standing up, every wall normal is horizontal while
+        # a preset's lights are all above, so the lower half of the wall turns
+        # away from all of them at once and the base goes black -- correct
+        # light, useless swatch. On its side the sweep runs under the key and
+        # the falloff reads as the form instead.
+        bmesh.ops.rotate(bm, verts=bm.verts, cent=(0.0, 0.0, 0.0),
+                         matrix=Matrix.Rotation(math.radians(90.0), 3, 'Y'))
+    mesh = bpy.data.meshes.new(f"MV_Patch_{kind.title()}")
+    bm.to_mesh(mesh)
+    bm.free()
+    return mesh, None
+
+
+def build_patch_lights(scene, specs, intensity=1.0):
+    """Light a patch scene from a lighting preset's specs. Returns what it made.
+
+    The same arithmetic build_lighting does for a product, with the subject's
+    size taken as one unit and no front-axis turn, since the patch camera is
+    fixed. That is what makes a swatch under a preset match a product render
+    under the same preset at a Target Size of 1.0.
+    """
+    made = []
+    for spec in specs:
+        kind = spec.get("type", 'AREA')
+        light = bpy.data.lights.new(f"MV_Patch_{spec.get('name', 'Light')}", type=kind)
+        size = spec.get("size", 1.0) * 0.5
+        if kind == 'AREA':
+            light.size = size
+            if "shape" in spec:
+                light.shape = spec["shape"]
+                light.size_y = spec.get("size_y", spec.get("size", 1.0)) * 0.5
+        elif kind in {'POINT', 'SPOT'}:
+            light.shadow_soft_size = size
+        if kind == 'SPOT':
+            light.spot_size = spec.get("spot_size", light.spot_size)
+            light.spot_blend = spec.get("spot_blend", light.spot_blend)
+        if kind == 'SUN':
+            light.angle = spec.get("angle", light.angle)
+        light.energy = float(spec["energy"]) * intensity
+        light.color = spec.get("color", (1.0, 1.0, 1.0))
+
+        obj = bpy.data.objects.new(light.name, light)
+        scene.collection.objects.link(obj)
+        pos = Vector(spec["pos"])
+        if "rot" in spec:
+            obj.matrix_world = (Matrix.Translation(pos)
+                                @ Quaternion(spec["rot"]).to_matrix().to_4x4())
+        else:
+            obj.matrix_world = look_at(pos, Vector((0.0, 0.0, 0.0)))
+        made += [obj, light]
+    return made
+
+
+def patch_grid(tiles, rows, columns, title, size, labels, tmp_dir):
+    """Composite a material's tiles into one image: shapes across, lighting down.
+
+    tiles is {(row label, column label): pixels}. Column headings run along
+    the top and row labels down the left, so a reader can tell which light and
+    which shape a tile is without counting.
+    """
+    gap = max(6, size // 32)
+    caption = max(11, size // 18)
+    title_h = int(caption * 2.2) if labels else 0
+    head_h = int(caption * 1.6) if labels else 0
+    side_w = (max([int(blf_width(r, caption)) for r in rows] + [0]) + gap
+              if labels else 0)
+
+    width = side_w + len(columns) * size + (len(columns) + 1) * gap
+    # The leading gap is counted once here and added to every row's offset
+    # below, so the margin above the first row matches the one below the last.
+    height = title_h + head_h + gap + len(rows) * (size + gap)
+    canvas = np.empty((height, width, 4), np.float32)
+    canvas[:] = (1.0, 1.0, 1.0, 1.0)
+    ink = np.array((0.1, 0.1, 0.1), np.float32)
+
+    def draw_text(text, text_size, x, y_top, max_w):
+        mask = text_mask(text, text_size, tmp_dir)
+        if mask is None:
+            return
+        mask = mask[:, :max(int(max_w), 1)]
+        layer = np.empty(mask.shape + (4,), np.float32)
+        layer[..., :3] = ink
+        layer[..., 3] = mask
+        paste_over(canvas, layer, int(x), height - int(y_top) - mask.shape[0])
+
+    if labels:
+        draw_text(title, int(caption * 1.5), gap, int(caption * 0.4), width - 2 * gap)
+        for col, name in enumerate(columns):
+            draw_text(name, caption, side_w + gap + col * (size + gap),
+                      title_h + int(caption * 0.2), size)
+
+    for row, row_name in enumerate(rows):
+        y_top = title_h + head_h + gap + row * (size + gap)
+        if labels:
+            draw_text(row_name, caption, gap, y_top + size // 2 - caption // 2, side_w)
+        for col, col_name in enumerate(columns):
+            px = tiles.get((row_name, col_name))
+            if px is None:
+                continue
+            x = side_w + gap + col * (size + gap)
+            paste_over(canvas, px, x, height - y_top - px.shape[0])
+    return canvas
+
+
+def blf_width(text, size):
+    """Width of text in the UI font, or a rough guess where blf cannot say."""
+    try:
+        blf.size(0, size)
+        return blf.dimensions(0, text)[0]
+    except Exception:
+        return len(text) * size * 0.55
+
+
 def render_patch(context, name, maps, path, size):
-    """One image per pool material: a flat swatch seen straight on, and a
-    ball under studio lights, side by side and labelled.
+    """One image per pool material: the material on each ticked shape, under
+    each ticked lighting condition, composited into a grid.
 
     Rendered in a scene of its own, so the user's scene is never touched.
-    Workbench cannot show textures properly, so Cycles stands in for it.
+    Workbench cannot show a texture properly, so Cycles stands in for it.
     """
     main = context.scene
+    s = main.mv_settings
+    shapes = patch_shape_keys(s)
+    lightings = patch_lightings(s)
+
     scene = bpy.data.scenes.new("MV_Patch")
     made = []
     work = tempfile.mkdtemp(prefix="mv_patch_")
@@ -3612,8 +3891,11 @@ def render_patch(context, name, maps, path, size):
             scene.cycles.device = main.cycles.device
         scene.render.resolution_x = scene.render.resolution_y = size
         scene.render.resolution_percentage = 100
-        scene.render.film_transparent = False
+        # Tiles are composited onto the grid's own white background, so each
+        # one is just the lit subject with nothing behind it.
+        scene.render.film_transparent = True
         scene.render.image_settings.file_format = 'PNG'
+        scene.render.image_settings.color_mode = 'RGBA'
         # The same colour management as the product renders, so a swatch shows
         # the material as it looks in them.
         scene.display_settings.display_device = main.display_settings.display_device
@@ -3630,74 +3912,83 @@ def render_patch(context, name, maps, path, size):
         bg = tree.nodes.new("ShaderNodeBackground")
         out = tree.nodes.new("ShaderNodeOutputWorld")
         tree.links.new(bg.outputs["Background"], out.inputs["Surface"])
+        bg.inputs["Color"].default_value = (PATCH_WORLD_GREY,) * 3 + (1.0,)
+        bg.inputs["Strength"].default_value = 1.0
         scene.world = world
 
-        def add(obj):
-            scene.collection.objects.link(obj)
-            made.append(obj)
-            if obj.data is not None:
-                made.append(obj.data)
-            return obj
+        # One camera for the solid shapes, framed on the sphere of PATCH_EXTENT
+        # that every one of them is built to sit inside. Framing on the shared
+        # sphere rather than on each shape's own silhouette is what makes the
+        # tiles comparable: each shape fills as much of its tile as its form
+        # allows, and the texture reads at one scale across the row.
+        radius = PATCH_EXTENT * 0.5
+        direction = Vector(PATCH_VIEW_DIR).normalized()
+        tan_x, tan_y = sensor_tangents(1.0, 1.0)
+        tan = min(tan_x, tan_y)
+        # A sphere touches the frame edge where the view angle is asin(r/d),
+        # not atan: using the tangent would leave it noticeably small.
+        distance = radius / (tan / math.sqrt(1.0 + tan * tan)) * PATCH_PADDING
 
-        def shoot(label):
-            scene.render.filepath = os.path.join(work, label)
-            bpy.ops.render.render(write_still=True, scene=scene.name)
-            return load_pixels(written_path(scene, scene.render.filepath))
+        solid_data = bpy.data.cameras.new("MV_Patch_View")
+        solid_data.lens = PERSP_LENS
+        solid_data.clip_start = max(distance * 0.01, 1e-5)
+        solid_data.clip_end = distance * 100.0
+        solid = bpy.data.objects.new("MV_Patch_View", solid_data)
+        solid.matrix_world = look_at(direction * distance, Vector((0.0, 0.0, 0.0)))
+        scene.collection.objects.link(solid)
+        made += [solid, solid_data]
 
-        # Flat swatch: one repeat of the texture filling the frame, lit evenly
-        # by a plain white environment.
-        bg.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
-        bg.inputs["Strength"].default_value = 1.0
-        plane_mesh = bpy.data.meshes.new("MV_Patch_Plane")
-        plane_mesh.from_pydata([(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)],
-                               [], [(0, 1, 2, 3)])
-        plane_mesh.materials.append(mat)
-        plane = add(bpy.data.objects.new("MV_Patch_Plane", plane_mesh))
-        plane[TILE_KEY] = 1.0
-        top_data = bpy.data.cameras.new("MV_Patch_Top")
-        top_data.type = 'ORTHO'
-        top_data.ortho_scale = 1.0
-        top = add(bpy.data.objects.new("MV_Patch_Top", top_data))
-        top.matrix_world = look_at(Vector((0, 0, 2)), Vector((0, 0, 0)))
-        scene.camera = top
-        flat = shoot("flat")
-        scene.collection.objects.unlink(plane)
+        flat_data = bpy.data.cameras.new("MV_Patch_Top")
+        flat_data.type = 'ORTHO'
+        flat_data.ortho_scale = 1.0
+        flat = bpy.data.objects.new("MV_Patch_Top", flat_data)
+        flat.matrix_world = look_at(Vector((0.0, 0.0, 2.0)), Vector((0.0, 0.0, 0.0)))
+        scene.collection.objects.link(flat)
+        made += [flat, flat_data]
 
-        # Ball: the same material on a sphere under a key, fill and rim light.
-        import bmesh
-        bg.inputs["Color"].default_value = (0.18, 0.18, 0.18, 1.0)
-        ball_mesh = bpy.data.meshes.new("MV_Patch_Ball")
-        bm = bmesh.new()
-        bmesh.ops.create_uvsphere(bm, u_segments=96, v_segments=48, radius=0.45)
-        for face in bm.faces:
-            face.smooth = True
-        bm.to_mesh(ball_mesh)
-        bm.free()
-        ball_mesh.materials.append(mat)
-        ball = add(bpy.data.objects.new("MV_Patch_Ball", ball_mesh))
-        ball[TILE_KEY] = 1.0
-        for label, pos, energy in (("Key", (1.6, -1.6, 2.0), 250.0),
-                                   ("Fill", (-2.0, -1.2, 0.8), 70.0),
-                                   ("Rim", (0.0, 2.2, 1.8), 150.0)):
-            light = bpy.data.lights.new(f"MV_Patch_{label}", type='AREA')
-            light.size = 1.5
-            light.energy = energy
-            obj = add(bpy.data.objects.new(f"MV_Patch_{label}", light))
-            obj.matrix_world = look_at(Vector(pos), Vector((0, 0, 0)))
-        cam_data = bpy.data.cameras.new("MV_Patch_View")
-        cam_data.lens = 50.0
-        view = add(bpy.data.objects.new("MV_Patch_View", cam_data))
-        view.matrix_world = look_at(Vector((0, -2.3, 1.0)), Vector((0, 0, 0)))
-        scene.camera = view
-        sphere = shoot("ball")
+        subjects = {}
+        for kind, _ in shapes:
+            mesh, ortho = patch_subject(kind)
+            mesh.materials.append(mat)
+            obj = bpy.data.objects.new(mesh.name, mesh)
+            # One repeat of the texture per unit, so the flat swatch shows
+            # exactly one and the solids show the pattern at the same scale.
+            obj[TILE_KEY] = 1.0
+            subjects[kind] = (obj, ortho)
+            made += [obj, mesh]
 
-        from types import SimpleNamespace
-        layout = SimpleNamespace(sheet_cell_width=size, sheet_columns=2, sheet_labels=True,
-                                 sheet_bg=(1.0, 1.0, 1.0, 1.0), sheet_text_color=(0.1, 0.1, 0.1))
-        sheet = contact_sheet([("Flat", flat), ("Ball", sphere)], name, layout, work)
+        tiles = {}
+        for light_label, specs in lightings:
+            lights = build_patch_lights(scene, specs, main.mv_settings.lighting_intensity)
+            try:
+                for kind, shape_label in shapes:
+                    obj, ortho = subjects[kind]
+                    scene.camera = flat if ortho is not None else solid
+                    scene.collection.objects.link(obj)
+                    try:
+                        scene.render.filepath = os.path.join(
+                            work, f"{len(tiles):03d}")
+                        bpy.ops.render.render(write_still=True, scene=scene.name)
+                        tiles[(light_label, shape_label)] = load_pixels(
+                            written_path(scene, scene.render.filepath))
+                    finally:
+                        scene.collection.objects.unlink(obj)
+            finally:
+                for block in lights:
+                    try:
+                        if isinstance(block, bpy.types.Object):
+                            bpy.data.objects.remove(block, do_unlink=True)
+                        else:
+                            bpy.data.lights.remove(block)
+                    except (ReferenceError, RuntimeError):
+                        pass
+
+        grid = patch_grid(tiles, [label for label, _ in lightings],
+                          [label for _, label in shapes], name, size,
+                          s.patch_labels, work)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        save_pixels(sheet, path, 'PNG')
-        return sheet.shape[1], sheet.shape[0]
+        save_pixels(grid, path, 'PNG')
+        return grid.shape[1], grid.shape[0]
     finally:
         bpy.data.scenes.remove(scene)
         for block in made:
@@ -4198,9 +4489,35 @@ class MV_OT_SetPool(Operator):
         return {'FINISHED'}
 
 
+class MV_OT_SyncPatchLighting(Operator):
+    """Refresh the lighting conditions from the lighting presets, built-in and
+    saved, keeping whatever is already ticked"""
+    bl_idname = "mv.sync_patch_lighting"
+    bl_label = "Refresh Lighting List"
+
+    def execute(self, context):
+        found = sync_patch_lighting(context.scene.mv_settings)
+        self.report({'INFO'}, f"{found} lighting preset(s) available.")
+        return {'FINISHED'}
+
+
+class MV_OT_SetPatchLighting(Operator):
+    """Tick or untick every lighting condition"""
+    bl_idname = "mv.set_patch_lighting"
+    bl_label = "Set Lighting Conditions"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    state: BoolProperty(default=True)
+
+    def execute(self, context):
+        for item in context.scene.mv_settings.patch_lighting:
+            item.enabled = self.state
+        return {'FINISHED'}
+
+
 class MV_OT_RenderPatches(Operator):
-    """Render a flat swatch and a material ball for every ticked pool material,
-    into the output folder's materials/ folder"""
+    """Render every ticked pool material on each ticked shape, under each
+    ticked lighting condition, into the output folder's materials/ folder"""
     bl_idname = "mv.render_patches"
     bl_label = "Render Patches"
 
@@ -6479,6 +6796,15 @@ def preflight(context, only_active=False):
         if s.pool_patches and scene.render.engine == 'BLENDER_WORKBENCH' \
                 and not hasattr(scene, "cycles"):
             _issue(issues, 'ERROR', "Patches need Cycles while the engine is Workbench")
+        if s.pool_patches:
+            # A saved preset deleted since it was ticked would otherwise drop
+            # a row out of every patch without saying so.
+            gone = [item.name for item in s.patch_lighting
+                    if item.enabled and not lighting_specs(item.key)]
+            if gone:
+                more = f" (+{len(gone) - 1} more)" if len(gone) > 1 else ""
+                _issue(issues, 'WARNING',
+                       f"Patch lighting '{gone[0]}'{more} cannot be read; skipped")
     if s.export_croissant and not s.dataset_license:
         _issue(issues, 'WARNING', "Croissant: dataset has no licence set")
 
@@ -8047,6 +8373,15 @@ class MV_UL_Pool(UIList):
         sub.label(text="".join(sorted({MAP_LETTERS.get(k, "") for k in maps})))
 
 
+class MV_UL_PatchLighting(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.prop(item, "enabled", text="")
+        sub = row.row(align=True)
+        sub.active = item.enabled
+        sub.label(text=item.name, icon='LIGHT')
+
+
 class MV_UL_Products(UIList):
     """MV_Products' children, each with its render tick and the label its
     files will carry. The label is worked out from the product's place in the
@@ -8439,20 +8774,55 @@ class MV_PT_Patch(_Sidebar, Panel):
 
     @classmethod
     def poll(cls, context):
-        return context.scene.mv_settings.part in POOL_PARTS
+        # Patches only. The Variants part is about textures on products, and a
+        # patch control there was the one place the sidebar still mixed two
+        # parts together. A job file can still set pool_patches for a run that
+        # wants both.
+        return context.scene.mv_settings.part == 'PATCHES'
 
     def draw(self, context):
         layout = self.layout
         s = context.scene.mv_settings
+
+        layout.label(text="Shapes, across:")
+        grid = layout.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
+        for i, (_, label, _) in enumerate(PATCH_SHAPES):
+            grid.prop(s, "patch_shapes", index=i, text=label)
+
+        row = layout.row(align=True)
+        row.label(text="Lighting, down:")
+        row.operator("mv.sync_patch_lighting", text="", icon='FILE_REFRESH')
+        if s.patch_lighting:
+            row = layout.row()
+            row.template_list("MV_UL_PatchLighting", "", s, "patch_lighting",
+                              s, "patch_lighting_index", rows=4)
+            col = row.column(align=True)
+            col.operator("mv.set_patch_lighting", text="", icon='CHECKBOX_HLT').state = True
+            col.operator("mv.set_patch_lighting", text="", icon='CHECKBOX_DEHLT').state = False
+        else:
+            layout.label(text="Refresh to list the lighting presets.", icon='INFO')
+
         layout.prop(s, "patch_size")
-        if s.part == 'VARIANTS':
-            layout.prop(s, "pool_patches", text="Render patches too")
-            layout.label(text="Patches are a part of their own;", icon='INFO')
-            layout.label(text="this adds them to a variants run.")
-            return
-        layout.label(text="A flat swatch and the same material", icon='INFO')
-        layout.label(text="on a lit ball, side by side, written")
-        layout.label(text="to materials/ in the output folder.")
+        layout.prop(s, "patch_labels")
+
+        shapes = patch_shape_keys(s)
+        # Counted rather than resolved: patch_lightings() reads every saved
+        # preset off disk, and draw() runs on every redraw.
+        lights = max(1, sum(1 for item in s.patch_lighting if item.enabled))
+        tiles = len(shapes) * lights
+        materials = len(pool_entries(s))
+        layout.label(text=f"{len(shapes)} shapes x {lights} lighting = {tiles} tiles")
+        layout.label(text=f"{materials} material(s), one grid each "
+                          f"({materials * tiles} renders)")
+        if not any(s.patch_shapes):
+            layout.label(text="No shape ticked, so the flat swatch", icon='ERROR')
+            layout.label(text="is used on its own.")
+        if not any(item.enabled for item in s.patch_lighting):
+            layout.label(text="No lighting ticked, so the built-in", icon='INFO')
+            layout.label(text="studio rig is used.")
+        layout.label(text="Saved lighting presets are listed here", icon='INFO')
+        layout.label(text="too: build a rig in a product scene,")
+        layout.label(text="save it under Stage, then refresh.")
         if context.scene.render.engine == 'BLENDER_WORKBENCH':
             layout.label(text="Workbench cannot show textures, so", icon='INFO')
             layout.label(text="patches render in Cycles instead.")
@@ -8912,6 +9282,7 @@ classes = (
     MV_StepFileItem,
     MV_Issue,
     MV_PoolMaterial,
+    MV_PatchLight,
     MV_CustomView,
     MV_Settings,
     MV_OT_AddStepFile,
@@ -8925,6 +9296,8 @@ classes = (
     MV_OT_ApplyWorld,
     MV_OT_ScanPool,
     MV_OT_SetPool,
+    MV_OT_SyncPatchLighting,
+    MV_OT_SetPatchLighting,
     MV_OT_RenderPatches,
     MV_OT_SaveLightingPreset,
     MV_OT_DeleteLightingPreset,
@@ -8946,6 +9319,7 @@ classes = (
     MV_UL_CustomViews,
     MV_UL_Products,
     MV_UL_Pool,
+    MV_UL_PatchLighting,
     # Panels draw in the sidebar in the order they are registered, and a
     # sub-panel's parent has to be registered before it.
     MV_PT_Mode,
