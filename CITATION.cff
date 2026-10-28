@@ -5,7 +5,7 @@ type: software
 authors:
   - given-names: Danyal
     family-names: Sarfraz
-version: 1.11.0
+version: 1.12.0
 license: MIT
 repository-code: "https://github.com/Danyals-code/Addon-for-MultiView-Rendering-AMVR"
 abstract: >-

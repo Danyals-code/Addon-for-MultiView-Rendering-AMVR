@@ -8,7 +8,7 @@ every view in one click, with predictable file names like `AA_01_Widget_Front_cl
 
 - **Blender:** 4.0 and newer
 - **Panel location:** `3D Viewport → Sidebar (N key) → MultiView`
-- **Version:** 1.11.0
+- **Version:** 1.12.0
 - **Cite:** see [`CITATION.cff`](CITATION.cff)
 
 ---
@@ -185,6 +185,79 @@ product's materials even when the batch has a preset.
 The products' own materials are never edited. The preset is applied by a temporary
 Geometry Nodes modifier, `MV_Material`, added while the product renders and removed
 afterwards, so it also works on STL imports, which arrive with no materials at all.
+
+#### Material Pool
+
+The **Material Pool** sub-panel turns a folder of PBR texture sets into materials for
+your products. Point **Texture Folder** at a folder holding one sub-folder per material, as
+downloaded from [ambientCG](https://ambientcg.com) or [Poly Haven](https://polyhaven.com),
+and click the refresh button. Every folder with a colour map becomes a pool material:
+
+```
+textures/
+  Bricks_A/      Bricks_A_1K-PNG_Color.png, _Roughness, _NormalGL, _Displacement
+  oak_veneer/    oak_veneer_diff_1k.png, _rough_1k, _arm_1k, _nor_gl_1k
+  Metal_Plate/   Metal_Plate_Color.jpg, Metal_Plate_Metalness.png
+```
+
+Maps are recognised by their names:
+- colour: `Color`, `BaseColor`, `Albedo`, `Diffuse`, `diff`
+- roughness: `Roughness`, `rough`
+- metallic: `Metalness`, `Metallic`, `metal`
+- packed AO/rough/metal: `arm`
+- height: `Displacement`, `Height`, `disp`, `bump`
+- opacity: `Opacity`, `Alpha`
+
+A folder holding a single image uses it as the colour map, unless its name ends in a data
+map's word (`_rough`, `_Metalness`, ...). A material is named after its folder. A folder
+called `textures`, `maps` or `2k` takes the name of the one above it, since Poly Haven
+downloads keep their maps in `<asset>/textures`. Two folders with the same name are told
+apart by their path (`wood_Oak`, `metal_Oak`). A material keeps its name when you scan
+again, so a library that later gains a second `Oak` names only the new one by its path.
+
+The list shows the maps found for each material as letters (**C** colour, **R** roughness,
+**M** metallic, **A** packed, **H** height, **N** normal, **O** opacity). Untick a material
+to leave it out.
+
+The list keeps where each texture file is. If the files move (a moved library, or the
+`.blend` opened on another machine), the folder is scanned again before rendering. If the
+textures a material uses still cannot be found, pre-flight stops the batch.
+
+CAD files have no UV maps, so the textures are box projected in each part's own
+coordinates. They stay put when the product turns and need no unwrapping. **Texture Size**
+is how much of the real part one repeat of a texture covers, in millimetres. A 100 mm wood
+texture looks the same size on a 30 mm knob and a 2 m cabinet, whatever scale Fit on Import
+gave them. A product built by hand and never standardized is taken to be in metres.
+
+Normal maps are listed but not used, because they need the UVs these meshes do not have.
+Opacity maps are listed but not used either. Masks, part IDs and COCO/BOP annotations are
+made once per view, so a material that cut holes in the product would leave them wrong for
+that image.
+
+**Product variants.** Set **Variants** above 0 and every Full render is made that many
+times per view, each with a different draw from the pool. With **Per Part** on, every part
+of the product draws its own material; off, the whole product shares one. A product set to
+**Keep Own** in **Products to render** is left out and renders once, in its own materials.
+
+The files get a `_v01`, `_v02`, ... suffix (or use `{variant}` in the naming templates), and
+each variant gets its own contact sheet. Clay renders, line art, masks, depth, normals and
+part IDs do not depend on the material, so they are rendered once per view. The manifest's
+`variant` and `materials` columns record what each image wears, for example
+`Block=Bricks_A; Peg=oak_veneer`.
+
+Draws come from the **Seed**, the product's label, the variant number and the part, so
+re-running gives the same variants. Adding variants, products or parts never changes the
+other draws. Adding or unticking a pool material changes only the draws it wins or held.
+The pool's contents are recorded in the manifest's provenance block.
+
+**Material patches.** **Render Patches** writes one image per ticked material into
+`materials/` in the output folder. It shows a flat swatch, one repeat seen straight on, next
+to a ball under studio lights, with the material's name above. Tick **With Render All** to
+make them as part of every batch, listed in the manifest. In a sharded command-line run the
+first shard makes them, and rendering just the active product skips them. Patches render in
+a scene of their own with the scene's colour management, and the pool materials are deleted
+again after each run, so your scene is untouched. They use Cycles when your engine is
+Workbench, which cannot show textures.
 
 ### 2. Import Products
 
@@ -538,6 +611,7 @@ change it with tokens:
 | `{product}` | `Widget` | The product collection's name |
 | `{view}` | `Front` | The camera view, or `Sheet` / `Turntable` |
 | `{mode}` | `clay` | `clay`, `render` (Both mode), or empty for Full Render |
+| `{variant}` | `v01` | The Material Pool variant, empty for everything rendered once |
 
 The defaults are `{label}_{product}` for the folder and `{label}_{product}_{view}_{mode}` for
 the file. A token that comes out empty takes one separator next to it along with it, so
@@ -550,6 +624,9 @@ the file. A token that comes out empty takes one separator next to it along with
   fields (the first image of the batch, as it will be written) instead of silently vanishing.
 - If the template would give two images the same name (no `{view}`, or no `{mode}` in Both
   mode), the render stops before it starts and says so.
+- With Material Pool variants on, a file name template without `{variant}` gets `_{variant}`
+  added at the end, unless the folder template has `{variant}`, e.g.
+  `{label}_{product}/{variant}`, which gives each variant a folder of its own.
 
 #### Contact sheets
 
@@ -612,9 +689,9 @@ copies are rebuilt.
 **Manifest** (CSV + JSON by default) writes `manifest.csv` and/or `manifest.json` into the
 output directory, listing every output with:
 
-`label`, `product`, `kind` (render, processed, sheet, turntable), `view`, `mode`, `path`
-(relative to the output directory), `width`, `height`, `source_file`, `source_size` and
-`source_units`.
+`label`, `product`, `kind` (render, processed, sheet, turntable, patch, ...), `view`, `mode`,
+`path` (relative to the output directory), `width`, `height`, `source_file`, `source_size`,
+`source_units`, `source_sha256`, `variant` and `materials` (see Material Pool).
 
 `source_file`, `source_size` and `source_units` are recorded when a file is imported:
 `source_size` is the product's bounding box before Fit on Import rescaled it, in
@@ -733,7 +810,7 @@ a faithful outline, not a finished drawing.
 | **Camera Jitter**, **Distance Jitter** | Each view's camera swings up to this far off its canonical direction, and moves nearer or farther |
 | **Lights** | The rig turns about the vertical by up to **Light Turn**, and each light changes strength by up to **Light Strength** |
 | **HDRI** | Each image is lit and backed by a random HDRI from **HDRI Folder** (empty: the studio HDRIs that ship with Blender), turned and scaled at random |
-| **Materials** | The product gets a random material preset and colour per image, in Full renders |
+| **Materials** | The product gets a random material preset and colour per image, in Full renders (not when Material Pool variants are on, which choose the materials instead) |
 | **Distractors** | Random shapes in random colours, placed behind the product as each camera sees it, in Full renders |
 
 Every draw comes from the **Seed**, the product's label and the view, so the same settings
