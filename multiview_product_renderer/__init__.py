@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MultiView Product Renderer",
     "author": "Danyal Sarfraz",
-    "version": (1, 11, 0),
+    "version": (1, 12, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > MultiView",
     "description": "Import CAD and mesh files, set up cameras and studio lighting, batch render products across views.",
@@ -13,6 +13,7 @@ import blf
 import os
 import re
 import csv
+import hashlib
 import json
 import math
 import struct
@@ -413,6 +414,15 @@ def lighting_specs(key):
     return lights
 
 
+class MV_PoolMaterial(PropertyGroup):
+    name: StringProperty(name="Name")
+    enabled: BoolProperty(name="Use", default=True,
+                          description="Draw this material when making variants and patches")
+    maps: StringProperty(description="JSON {map kind: file path}", options={'HIDDEN'})
+    key: StringProperty(description="Colour map's path inside the pool folder",
+                        options={'HIDDEN'})
+
+
 class MV_Issue(PropertyGroup):
     severity: StringProperty()
     message: StringProperty()
@@ -577,6 +587,46 @@ class MV_Settings(PropertyGroup):
         name="Color", subtype='COLOR', size=3,
         min=0.0, max=1.0, default=(0.8, 0.8, 0.8),
     )
+
+    pool_folder: StringProperty(
+        name="Texture Folder", subtype='DIR_PATH',
+        description="Folder of PBR texture sets, one folder per material, as downloaded "
+                    "from ambientCG or Poly Haven. Scan it to fill the pool",
+    )
+    material_pool: CollectionProperty(type=MV_PoolMaterial)
+    material_pool_index: IntProperty(default=0)
+    pool_tile_mm: FloatProperty(
+        name="Texture Size",
+        description="How much of the real part one repeat of a texture covers, in "
+                    "millimetres. Kept the same whatever scale the product renders at",
+        default=100.0, min=0.1, soft_max=2000.0,
+    )
+    pool_variants: IntProperty(
+        name="Variants",
+        description="Render every product this many times in Full renders, each time with "
+                    "materials drawn from the pool. 0 turns variants off. Clay, line art, "
+                    "masks and data passes do not change with materials, so they are "
+                    "rendered once",
+        default=0, min=0, max=500,
+    )
+    pool_seed: IntProperty(
+        name="Seed", default=0, min=0,
+        description="The same seed always gives the same materials for each product and "
+                    "variant",
+    )
+    pool_per_part: BoolProperty(
+        name="Per Part", default=True,
+        description="Each part draws its own material. Off, the whole product gets one "
+                    "material per variant",
+    )
+    pool_patches: BoolProperty(
+        name="Patches",
+        description="With Render All, also write one image per pool material: a flat "
+                    "swatch and a material ball side by side, in materials/",
+        default=False,
+    )
+    patch_size: IntProperty(name="Patch Size", default=512, min=64, max=4096,
+                            description="Pixels per side of each half of a patch")
 
     render_output_dir: StringProperty(
         name="Output Directory", subtype='DIR_PATH', default="//renders/",
@@ -806,8 +856,9 @@ class MV_Settings(PropertyGroup):
         name="File Name",
         description="Name of each image, without extension. Tokens: {label} (AA_01), "
                     "{prefix} (AA), {number} (01), {product}, {view}, {mode} (render, "
-                    "clay, or nothing for Full Render). A token that comes out empty "
-                    "takes one separator next to it with it",
+                    "clay, or nothing for Full Render), {variant} (v01, ... for Material "
+                    "Pool variants, added at the end if missing). A token that comes out "
+                    "empty takes one separator next to it with it",
         default="{label}_{product}_{view}_{mode}",
     )
     folder_template: StringProperty(
@@ -3054,6 +3105,505 @@ def remove_product_materials():
         for mod in [m for m in obj.modifiers
                     if m.type == 'NODES' and m.name.startswith(MATERIAL_MOD)]:
             obj.modifiers.remove(mod)
+        if TILE_KEY in obj:
+            del obj[TILE_KEY]
+
+
+# -- material pool ----------------------------------------------------------------
+#
+# A folder of PBR texture sets, as downloaded from ambientCG or Poly Haven:
+# one folder per material, holding its colour, roughness, metallic, normal and
+# height maps. Each becomes a Blender material that can be put on any part.
+#
+# CAD tessellations have no UV maps, so the textures are box projected in the
+# object's own coordinates: they stick to the part when it turns, and need no
+# unwrapping. How big one repeat of the texture is comes from an object
+# custom property the material reads, so one material serves products of
+# every size and is always shown at the same real-world scale.
+
+TILE_KEY = "mv_tile_scale"
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".exr", ".webp", ".bmp", ".tga"}
+# Checked in this order, against the file's name with the material's shared
+# prefix removed. Metallic is last because "metal" is also a common word in
+# material names; the prefix is stripped first for the same reason.
+MAP_KEYWORDS = (
+    ("arm", {"arm"}),
+    ("normal_dx", {"normaldx", "nordx", "dx"}),
+    ("normal", {"normalgl", "norgl", "normal", "nor", "nrm", "gl"}),
+    ("color", {"basecolor", "albedo", "diffuse", "diff", "color", "colour", "col"}),
+    ("roughness", {"roughness", "rough", "rgh"}),
+    ("height", {"displacement", "height", "disp", "bump"}),
+    ("opacity", {"opacity", "alpha"}),
+    ("ao", {"ambientocclusion", "occlusion", "ao"}),
+    ("metallic", {"metalness", "metallic", "metal", "mtl"}),
+)
+MAP_LETTERS = {"color": "C", "roughness": "R", "metallic": "M", "arm": "A",
+               "normal": "N", "normal_dx": "N", "height": "H", "opacity": "O", "ao": "o"}
+
+
+def classify_maps(files):
+    """{map kind: path} for one folder's image files."""
+    if len(files) == 1:
+        # A folder with one picture in it is a plain colour texture
+        # ("Brushed_Metal.jpg"), unless its name ends in the word for a data
+        # map ("thing_rough_2k", "x_Metalness"). Plain "metal" is left out:
+        # it names materials too.
+        stem = os.path.splitext(os.path.basename(files[0]))[0].lower()
+        tokens = [t for t in re.split(r"[_\-. ]+", stem)
+                  if t and not re.fullmatch(r"\d+k|png|jpe?g|exr", t)]
+        last = tokens[-1] if tokens else ""
+        kind = next((kind for kind, keys in MAP_KEYWORDS
+                     if last in keys and kind != "color" and last != "metal"), None)
+        return {kind or "color": files[0]}
+    stems = [os.path.splitext(os.path.basename(f))[0].lower() for f in files]
+    # The shared start of the names, cut back to a separator so it never eats
+    # the start of a map's own word: rock_diff and rock_disp share "rock_",
+    # not "rock_di".
+    prefix = os.path.commonprefix(stems)
+    prefix = prefix[:max(prefix.rfind(c) for c in "_-. ") + 1]
+    found = {}
+    unknown = []
+    for path, stem in zip(files, stems):
+        tokens = [t for t in re.split(r"[_\-. ]+", stem[len(prefix):]) if t]
+        # Pairs catch maps split by a separator: nor_gl, normal_dx.
+        words = set(tokens) | {a + b for a, b in zip(tokens, tokens[1:])}
+        kind = next((kind for kind, keys in MAP_KEYWORDS if words & keys), None)
+        if kind is None:
+            unknown.append(path)
+        else:
+            found.setdefault(kind, path)
+    if "normal" not in found and "normal_dx" in found:
+        found["normal"] = found["normal_dx"]
+    # Maps named for what they are, next to one picture named for nothing:
+    # that picture is the colour.
+    if "color" not in found and len(unknown) == 1:
+        found["color"] = unknown[0]
+    return found
+
+
+# Folders that say how a set was packed rather than what it is: the
+# material's name is the folder above. Poly Haven keeps every asset's maps
+# in "<asset>/textures".
+GENERIC_FOLDERS = re.compile(r"^(textures?|maps?|tex|images?|img|pbr|\d+k|png|jpe?g|exr)$",
+                             re.IGNORECASE)
+
+
+def pool_key(folder, color_path):
+    """What identifies a material across scans: its colour map's path inside
+    the pool folder, which stays the same when the whole library moves."""
+    rel = os.path.relpath(color_path, os.path.normpath(bpy.path.abspath(folder or "")))
+    return os.path.normcase(rel).replace("\\", "/")
+
+
+def scan_pool(folder, keep=None):
+    """[(name, {map: path})] for every texture set under folder, sorted. A
+    folder counts as a material when it has a colour map. Names are unique,
+    also once made safe for file names, since patches are saved under them.
+
+    keep is {pool_key: name} from an earlier scan. Those materials keep their
+    names, so a library that gains a second "Oak" names only the newcomer by
+    its path, rather than renaming the Oak every draw and tick refers to."""
+    keep = keep or {}
+    folder = os.path.normpath(bpy.path.abspath(folder or ""))
+    if not os.path.isdir(folder):
+        return []
+    found = []
+    for current, dirs, files in os.walk(folder):
+        dirs.sort()
+        images = sorted(os.path.join(current, f) for f in files
+                        if file_ext(f) in IMAGE_EXTENSIONS)
+        maps = classify_maps(images) if images else {}
+        if "color" not in maps:
+            continue
+        place = os.path.normpath(current)
+        while GENERIC_FOLDERS.match(os.path.basename(place)) and place != folder:
+            place = os.path.dirname(place)
+        found.append((place, maps))
+    def slot(name):
+        return safe_name(name).lower()
+
+    names, taken = [None] * len(found), set()
+    for i, (_, maps) in enumerate(found):
+        old = keep.get(pool_key(folder, maps["color"]))
+        if old and slot(old) not in taken:
+            names[i] = old
+            taken.add(slot(old))
+    counts = {}
+    for i, (place, _) in enumerate(found):
+        if names[i] is None:
+            key = slot(os.path.basename(place))
+            counts[key] = counts.get(key, 0) + 1
+    for i, (place, _) in enumerate(found):
+        if names[i] is not None:
+            continue
+        name = os.path.basename(place)
+        if counts[slot(name)] > 1 or slot(name) in taken:
+            # Two "Oak" folders in different places: name them by where they are.
+            rel = os.path.relpath(place, folder)
+            name = "_".join(p for p in rel.split(os.sep) if p not in {"", "."}) or name
+        unique, n = name, 2
+        while slot(unique) in taken:
+            unique, n = f"{name}_{n}", n + 1
+        taken.add(slot(unique))
+        names[i] = unique
+    return [(name, maps) for name, (_, maps) in zip(names, found)]
+
+
+def scan_pool_into(settings):
+    """Fill the pool list from its folder, keeping each material's name and
+    tick."""
+    old = {m.key: (m.name, m.enabled) for m in settings.material_pool if m.key}
+    ticks = {m.name: m.enabled for m in settings.material_pool}
+    settings.material_pool.clear()
+    folder = settings.pool_folder
+    for name, maps in scan_pool(folder, keep={k: n for k, (n, _) in old.items()}):
+        key = pool_key(folder, maps["color"])
+        item = settings.material_pool.add()
+        item.name = name
+        item.key = key
+        item.maps = json.dumps(maps)
+        item.enabled = old[key][1] if key in old else ticks.get(name, True)
+    return len(settings.material_pool)
+
+
+def pool_entries(settings):
+    """[(name, maps)] of the ticked pool materials."""
+    entries = []
+    for item in settings.material_pool:
+        if item.enabled:
+            try:
+                entries.append((item.name, json.loads(item.maps)))
+            except ValueError:
+                continue
+    return entries
+
+
+# The maps pool_material reads. The rest are listed but never loaded, so a
+# missing normal or AO file does not matter.
+USED_MAPS = {"color", "roughness", "metallic", "arm", "height"}
+
+
+def pool_missing(settings):
+    """Ticked pool materials with a texture file it uses that is no longer there."""
+    return [name for name, maps in pool_entries(settings)
+            if not all(os.path.isfile(p) for k, p in maps.items() if k in USED_MAPS)]
+
+
+def refresh_pool(settings):
+    """Scan the folder again when the pool is empty or points at files that
+    have gone: a moved library, or a .blend opened on another machine, where
+    the folder setting (relative to the .blend) still finds the textures."""
+    if not os.path.isdir(bpy.path.abspath(settings.pool_folder or "")):
+        return
+    if not settings.material_pool or pool_missing(settings):
+        scan_pool_into(settings)
+
+
+def pool_snapshot(settings):
+    """The pool as provenance records it: every material, ticked or not, and
+    the files it was made from."""
+    snap = []
+    for item in settings.material_pool:
+        try:
+            maps = json.loads(item.maps)
+        except ValueError:
+            maps = {}
+        snap.append({"name": item.name, "enabled": item.enabled,
+                     "maps": {k: os.path.basename(v) for k, v in sorted(maps.items())}})
+    return snap
+
+
+def remove_pool_materials():
+    """Delete the pool materials a run made, and the textures only they used."""
+    images = set()
+    for mat in [m for m in bpy.data.materials if m.name.startswith("MV_Pool_")]:
+        if mat.node_tree is not None:
+            images.update(n.image for n in mat.node_tree.nodes
+                          if n.type == 'TEX_IMAGE' and n.image is not None)
+        bpy.data.materials.remove(mat)
+    for image in images:
+        if image.users == 0:
+            bpy.data.images.remove(image)
+
+
+def pool_material(name, maps):
+    """A Principled material from a texture set, box projected at the scale
+    each object's mv_tile_scale property asks for (repeats per unit).
+
+    Built once and then reused for as long as the texture set is the same:
+    rebuilding the nodes would make EEVEE compile the shader again."""
+    mat_name = f"MV_Pool_{name}"
+    signature = json.dumps(maps, sort_keys=True)
+    mat = bpy.data.materials.get(mat_name)
+    if mat is not None and mat.get("mv_pool_maps") == signature:
+        return mat
+    mat = mat or bpy.data.materials.new(mat_name)
+    mat["mv_pool_maps"] = signature
+    tree = node_tree_of(mat)
+    tree.nodes.clear()
+    nodes, links = tree.nodes, tree.links
+    out = nodes.new("ShaderNodeOutputMaterial")
+    out.location = (900, 0)
+    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.location = (550, 0)
+    links.new(bsdf.outputs[0], out.inputs["Surface"])
+    coords = nodes.new("ShaderNodeTexCoord")
+    coords.location = (-900, 0)
+    tile = nodes.new("ShaderNodeAttribute")
+    tile.location = (-900, -250)
+    tile.attribute_type = 'OBJECT'
+    tile.attribute_name = TILE_KEY
+    scaled = nodes.new("ShaderNodeVectorMath")
+    scaled.location = (-650, 0)
+    scaled.operation = 'SCALE'
+    links.new(coords.outputs["Object"], scaled.inputs[0])
+    links.new(tile.outputs["Fac"], scaled.inputs["Scale"])
+
+    def texture(kind, y, data=True):
+        node = nodes.new("ShaderNodeTexImage")
+        node.location = (-350, y)
+        node.image = bpy.data.images.load(maps[kind], check_existing=True)
+        # Colour keeps the space Blender reads from the file (sRGB for 8-bit,
+        # linear for EXR); setting one that is already set reloads the image.
+        if data and node.image.colorspace_settings.name != 'Non-Color':
+            node.image.colorspace_settings.name = 'Non-Color'
+        node.projection = 'BOX'
+        node.projection_blend = 0.25
+        links.new(scaled.outputs["Vector"], node.inputs["Vector"])
+        return node
+
+    links.new(texture("color", 300, data=False).outputs["Color"], bsdf.inputs["Base Color"])
+    if "roughness" in maps:
+        links.new(texture("roughness", 0).outputs["Color"], bsdf.inputs["Roughness"])
+    if "metallic" in maps:
+        links.new(texture("metallic", -250).outputs["Color"], bsdf.inputs["Metallic"])
+    if "arm" in maps and ("roughness" not in maps or "metallic" not in maps):
+        arm = texture("arm", -500)
+        split = nodes.new("ShaderNodeSeparateColor")
+        split.location = (150, -500)
+        links.new(arm.outputs["Color"], split.inputs["Color"])
+        if "roughness" not in maps:
+            links.new(split.outputs[1], bsdf.inputs["Roughness"])
+        if "metallic" not in maps:
+            links.new(split.outputs[2], bsdf.inputs["Metallic"])
+    # Opacity maps are left off on purpose. Masks, part IDs, COCO and BOP are
+    # rendered once per view, not per variant, so a material that cut holes
+    # in the product would leave every annotation of that image wrong.
+    # Tangent-space normal maps need UVs these meshes do not have; the height
+    # map drives a bump instead, which works with any projection.
+    if "height" in maps:
+        bump = nodes.new("ShaderNodeBump")
+        bump.location = (300, -300)
+        bump.inputs["Strength"].default_value = 0.4
+        links.new(texture("height", -1000).outputs["Color"], bump.inputs["Height"])
+        links.new(bump.outputs["Normal"], bsdf.inputs["Normal"])
+    return mat
+
+
+def tile_scale(obj, coll, tile_mm):
+    """Texture repeats per object-space unit, so one repeat covers tile_mm of
+    the real part whatever scale it is rendered at."""
+    to_world = product_to_world(coll)
+    world_per_source = abs(to_world.to_3x3().determinant()) ** (1.0 / 3.0) or 1.0
+    # No recorded units: a product built by hand and never standardized,
+    # which is in Blender units, metres.
+    tile_world = tile_mm / UNIT_TO_MM.get(coll.mv_source_units or "m", 1.0) * world_per_source
+    object_scale = sum(obj.matrix_world.to_3x3().to_scale()) / 3.0 or 1.0
+    return object_scale / max(tile_world, 1e-9)
+
+
+def materials_text(assignment):
+    """'Body=Brushed_Steel; Lid=Oak' for the manifest, or '' for no variant."""
+    if not assignment:
+        return ""
+    return "; ".join(f"{part}={mat}" for part, mat in sorted(assignment.items()))
+
+
+def pool_draw(seed, label, variant, part, names):
+    """One material from names, for one part of one variant.
+
+    Every material gets a score from a hash of the seed, the product, the
+    variant, the part and its own name, and the highest wins. That is a fair
+    draw, and one that depends on nothing else: adding a product, a variant
+    or a part changes no one else's materials, and adding or unticking a pool
+    material changes only the draws it wins or held."""
+    def score(name):
+        key = f"{seed}\x1f{label}\x1f{variant}\x1f{part}\x1f{name}".encode("utf-8")
+        return hashlib.blake2b(key, digest_size=8).digest()
+    return max(names, key=score)
+
+
+def takes_variants(coll):
+    """False for a product set to Keep Own in Products to render: it renders
+    once, in its own materials, like it does against a batch preset."""
+    return getattr(coll, "mv_material", 'DEFAULT') != 'KEEP'
+
+
+def variant_assignments(settings, label, parts, entries):
+    """[(variant name, {part: pool material})] for one product."""
+    names = [n for n, _ in entries]
+    variants = []
+    for v in range(1, settings.pool_variants + 1):
+        if settings.pool_per_part:
+            assignment = {p: pool_draw(settings.pool_seed, label, v, p, names) for p in parts}
+        else:
+            pick = pool_draw(settings.pool_seed, label, v, "", names)
+            assignment = {p: pick for p in parts}
+        variants.append((f"v{v:02d}", assignment))
+    return variants
+
+
+def apply_variant(settings, coll, assignment, entries):
+    """Put a variant's pool materials on a product's parts through the same
+    temporary modifiers the presets use."""
+    maps = dict(entries)
+    group = material_node_group()
+    socket = next(item.identifier for item in group.interface.items_tree
+                  if getattr(item, "in_out", None) == 'INPUT'
+                  and getattr(item, "socket_type", None) == 'NodeSocketMaterial')
+    for obj in collection_meshes(coll):
+        # Linked objects cannot carry modifiers or properties; like the
+        # presets, they keep their own materials.
+        if obj.type != 'MESH' or obj.library is not None or obj.name not in assignment:
+            continue
+        pick = assignment[obj.name]
+        mod = next((m for m in obj.modifiers
+                    if m.type == 'NODES' and m.name.startswith(MATERIAL_MOD)), None)
+        if mod is None:
+            mod = obj.modifiers.new(MATERIAL_MOD, 'NODES')
+            mod.node_group = group
+        # Only what changed is written: every write makes the object
+        # evaluate again.
+        mat = pool_material(pick, maps[pick])
+        scale = tile_scale(obj, coll, settings.pool_tile_mm)
+        if mod.get(socket) != mat or obj.get(TILE_KEY) != scale:
+            mod[socket] = mat
+            obj[TILE_KEY] = scale
+            obj.update_tag()
+
+
+def render_patch(context, name, maps, path, size):
+    """One image per pool material: a flat swatch seen straight on, and a
+    ball under studio lights, side by side and labelled.
+
+    Rendered in a scene of its own, so the user's scene is never touched.
+    Workbench cannot show textures properly, so Cycles stands in for it.
+    """
+    main = context.scene
+    scene = bpy.data.scenes.new("MV_Patch")
+    made = []
+    work = tempfile.mkdtemp(prefix="mv_patch_")
+    try:
+        engine = main.render.engine if main.render.engine != 'BLENDER_WORKBENCH' else 'CYCLES'
+        scene.render.engine = engine
+        if engine == 'CYCLES' and hasattr(main, "cycles"):
+            scene.cycles.samples = min(main.cycles.samples, 64)
+            scene.cycles.device = main.cycles.device
+        scene.render.resolution_x = scene.render.resolution_y = size
+        scene.render.resolution_percentage = 100
+        scene.render.film_transparent = False
+        scene.render.image_settings.file_format = 'PNG'
+        # The same colour management as the product renders, so a swatch shows
+        # the material as it looks in them.
+        scene.display_settings.display_device = main.display_settings.display_device
+        scene.view_settings.view_transform = main.view_settings.view_transform
+        scene.view_settings.look = main.view_settings.look
+        scene.view_settings.exposure = main.view_settings.exposure
+        scene.view_settings.gamma = main.view_settings.gamma
+        mat = pool_material(name, maps)
+
+        world = bpy.data.worlds.new("MV_Patch_World")
+        made.append(world)
+        tree = node_tree_of(world)
+        tree.nodes.clear()
+        bg = tree.nodes.new("ShaderNodeBackground")
+        out = tree.nodes.new("ShaderNodeOutputWorld")
+        tree.links.new(bg.outputs["Background"], out.inputs["Surface"])
+        scene.world = world
+
+        def add(obj):
+            scene.collection.objects.link(obj)
+            made.append(obj)
+            if obj.data is not None:
+                made.append(obj.data)
+            return obj
+
+        def shoot(label):
+            scene.render.filepath = os.path.join(work, label)
+            bpy.ops.render.render(write_still=True, scene=scene.name)
+            return load_pixels(written_path(scene, scene.render.filepath))
+
+        # Flat swatch: one repeat of the texture filling the frame, lit evenly
+        # by a plain white environment.
+        bg.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+        bg.inputs["Strength"].default_value = 1.0
+        plane_mesh = bpy.data.meshes.new("MV_Patch_Plane")
+        plane_mesh.from_pydata([(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)],
+                               [], [(0, 1, 2, 3)])
+        plane_mesh.materials.append(mat)
+        plane = add(bpy.data.objects.new("MV_Patch_Plane", plane_mesh))
+        plane[TILE_KEY] = 1.0
+        top_data = bpy.data.cameras.new("MV_Patch_Top")
+        top_data.type = 'ORTHO'
+        top_data.ortho_scale = 1.0
+        top = add(bpy.data.objects.new("MV_Patch_Top", top_data))
+        top.matrix_world = look_at(Vector((0, 0, 2)), Vector((0, 0, 0)))
+        scene.camera = top
+        flat = shoot("flat")
+        scene.collection.objects.unlink(plane)
+
+        # Ball: the same material on a sphere under a key, fill and rim light.
+        import bmesh
+        bg.inputs["Color"].default_value = (0.18, 0.18, 0.18, 1.0)
+        ball_mesh = bpy.data.meshes.new("MV_Patch_Ball")
+        bm = bmesh.new()
+        bmesh.ops.create_uvsphere(bm, u_segments=96, v_segments=48, radius=0.45)
+        for face in bm.faces:
+            face.smooth = True
+        bm.to_mesh(ball_mesh)
+        bm.free()
+        ball_mesh.materials.append(mat)
+        ball = add(bpy.data.objects.new("MV_Patch_Ball", ball_mesh))
+        ball[TILE_KEY] = 1.0
+        for label, pos, energy in (("Key", (1.6, -1.6, 2.0), 250.0),
+                                   ("Fill", (-2.0, -1.2, 0.8), 70.0),
+                                   ("Rim", (0.0, 2.2, 1.8), 150.0)):
+            light = bpy.data.lights.new(f"MV_Patch_{label}", type='AREA')
+            light.size = 1.5
+            light.energy = energy
+            obj = add(bpy.data.objects.new(f"MV_Patch_{label}", light))
+            obj.matrix_world = look_at(Vector(pos), Vector((0, 0, 0)))
+        cam_data = bpy.data.cameras.new("MV_Patch_View")
+        cam_data.lens = 50.0
+        view = add(bpy.data.objects.new("MV_Patch_View", cam_data))
+        view.matrix_world = look_at(Vector((0, -2.3, 1.0)), Vector((0, 0, 0)))
+        scene.camera = view
+        sphere = shoot("ball")
+
+        from types import SimpleNamespace
+        layout = SimpleNamespace(sheet_cell_width=size, sheet_columns=2, sheet_labels=True,
+                                 sheet_bg=(1.0, 1.0, 1.0, 1.0), sheet_text_color=(0.1, 0.1, 0.1))
+        sheet = contact_sheet([("Flat", flat), ("Ball", sphere)], name, layout, work)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        save_pixels(sheet, path, 'PNG')
+        return sheet.shape[1], sheet.shape[0]
+    finally:
+        bpy.data.scenes.remove(scene)
+        for block in made:
+            try:
+                if isinstance(block, bpy.types.Object):
+                    bpy.data.objects.remove(block, do_unlink=True)
+                elif isinstance(block, bpy.types.Mesh):
+                    bpy.data.meshes.remove(block)
+                elif isinstance(block, bpy.types.Camera):
+                    bpy.data.cameras.remove(block)
+                elif isinstance(block, bpy.types.Light):
+                    bpy.data.lights.remove(block)
+                elif isinstance(block, bpy.types.World):
+                    bpy.data.worlds.remove(block)
+            except ReferenceError:
+                pass
+        shutil.rmtree(work, ignore_errors=True)
 
 
 class MV_OT_AddStepFile(Operator, ImportHelper):
@@ -3502,6 +4052,71 @@ class MV_OT_ApplyWorld(Operator):
             return {'CANCELLED'}
         build_ground(context)
         return {'FINISHED'}
+
+
+class MV_OT_ScanPool(Operator):
+    """Find the texture sets in the Texture Folder and list them in the pool"""
+    bl_idname = "mv.scan_pool"
+    bl_label = "Scan Folder"
+
+    def execute(self, context):
+        s = context.scene.mv_settings
+        if not os.path.isdir(bpy.path.abspath(s.pool_folder)):
+            self.report({'ERROR'}, "Pick a texture folder first.")
+            return {'CANCELLED'}
+        found = scan_pool_into(s)
+        if not found:
+            self.report({'WARNING'}, "No texture sets found: each needs a colour map "
+                                     "(…_Color, …_diff, …_albedo).")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Found {found} material(s).")
+        return {'FINISHED'}
+
+
+class MV_OT_SetPool(Operator):
+    """Tick or untick every material in the pool"""
+    bl_idname = "mv.set_pool"
+    bl_label = "Set Pool"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    state: BoolProperty(default=True)
+
+    def execute(self, context):
+        for item in context.scene.mv_settings.material_pool:
+            item.enabled = self.state
+        return {'FINISHED'}
+
+
+class MV_OT_RenderPatches(Operator):
+    """Render a flat swatch and a material ball for every ticked pool material,
+    into the output folder's materials/ folder"""
+    bl_idname = "mv.render_patches"
+    bl_label = "Render Patches"
+
+    def execute(self, context):
+        s = context.scene.mv_settings
+        refresh_pool(s)
+        entries = pool_entries(s)
+        if not entries:
+            self.report({'ERROR'}, "The material pool is empty: scan a texture folder.")
+            return {'CANCELLED'}
+        folder = os.path.join(bpy.path.abspath(s.render_output_dir), "materials")
+        written, failed = 0, []
+        for name, maps in entries:
+            try:
+                render_patch(context, name, maps,
+                             os.path.join(folder, safe_name(name) + "_patch.png"), s.patch_size)
+                written += 1
+            except (RuntimeError, OSError) as exc:
+                failed.append(f"{name}: {exc}")
+                print(f"[MultiView] patch FAILED {name}: {exc}")
+        remove_pool_materials()
+        if failed:
+            self.report({'WARNING'}, f"Wrote {written} patch(es); {len(failed)} failed, first: "
+                                     f"{failed[0]}")
+        else:
+            self.report({'INFO'}, f"Wrote {written} patch(es) to {folder}")
+        return {'FINISHED'} if written else {'CANCELLED'}
 
 
 class MV_OT_SaveLightingPreset(Operator):
@@ -4625,12 +5240,12 @@ def expand_template(template, values):
     return out + literal
 
 
-def name_values(settings, index, product, view, mode):
+def name_values(settings, index, product, view, mode, variant=""):
     label = product_label(settings.start_prefix, settings.start_number, index,
                           settings.products_per_letter)
     prefix, _, number = label.rpartition("_")
     return {"label": label, "prefix": prefix, "number": number,
-            "product": product, "view": view, "mode": mode}
+            "product": product, "view": view, "mode": mode, "variant": variant}
 
 
 def output_folder(settings, values):
@@ -4649,7 +5264,14 @@ def output_folder(settings, values):
 
 
 def output_basename(settings, values):
-    return safe_name(expand_template(settings.file_template or DEFAULT_FILE_TEMPLATE, values))
+    template = settings.file_template or DEFAULT_FILE_TEMPLATE
+    # A template written before variants existed still has to keep each
+    # variant's images apart, so the variant goes on the end, unless the
+    # folder template already puts each variant in a folder of its own.
+    if values.get("variant") and "{variant}" not in template \
+            and "{variant}" not in (settings.folder_template or DEFAULT_FOLDER_TEMPLATE):
+        template += "_{variant}"
+    return safe_name(expand_template(template, values))
 
 
 class _NameClash(Exception):
@@ -5171,7 +5793,7 @@ def encode_gif(frames, out_path, fps, max_size, background):
 MEASURABLE_IMAGES = {".png", ".jpg", ".jpeg", ".webp", ".exr", ".tif", ".tiff", ".bmp"}
 MANIFEST_FIELDS = ("label", "product", "kind", "view", "mode", "path",
                    "width", "height", "source_file", "source_size", "source_units",
-                   "source_sha256")
+                   "source_sha256", "variant", "materials")
 
 
 REPOSITORY_URL = "https://github.com/Danyals-code/Addon-for-MultiView-Rendering-AMVR"
@@ -5188,7 +5810,6 @@ def tool_citation():
 
 
 def file_sha256(path):
-    import hashlib
     digest = hashlib.sha256()
     with open(path, "rb") as f:
         for block in iter(lambda: f.read(1 << 20), b""):
@@ -5212,6 +5833,8 @@ def settings_snapshot(settings):
     snap["custom_views"] = [{"name": cv.name, "enabled": cv.enabled, "ortho": cv.is_ortho,
                              "direction": [cv.dir_x, cv.dir_y, cv.dir_z]}
                             for cv in settings.custom_views]
+    # Which materials were in the pool decides every variant's draws.
+    snap["material_pool"] = pool_snapshot(settings)
     return snap
 
 
@@ -5349,6 +5972,10 @@ def write_manifest(out_root, records, labels, fmt, name="manifest", provenance=N
     files that are no longer on disk are dropped.
     """
     rows = [r for r in read_manifest(out_root, name) if r.get("label") not in labels]
+    # Rows from a manifest written before these columns existed.
+    for row in rows:
+        row.setdefault("variant", "")
+        row.setdefault("materials", "")
     for rec in records:
         if not file_ok(rec["path"]):
             continue
@@ -5356,6 +5983,8 @@ def write_manifest(out_root, records, labels, fmt, name="manifest", provenance=N
         if width is None and file_ext(rec["path"]) in MEASURABLE_IMAGES:
             width, height = image_size(rec["path"])
         row = {k: rec.get(k) for k in MANIFEST_FIELDS}
+        row["variant"] = rec.get("variant") or ""
+        row["materials"] = rec.get("materials") or ""
         row.update(path=os.path.relpath(rec["path"], out_root).replace("\\", "/"),
                    width=width, height=height)
         rows.append(row)
@@ -5699,6 +6328,20 @@ def preflight(context, only_active=False):
         _issue(issues, 'ERROR', "Data passes and drawings need Cycles")
     if s.random_enabled and s.random_hdri and not hdri_files(s):
         _issue(issues, 'WARNING', "Randomize: no HDRIs in the HDRI folder")
+    if s.pool_variants or s.pool_patches:
+        refresh_pool(s)
+        missing = pool_missing(s)
+        if not pool_entries(s):
+            _issue(issues, 'ERROR', "Material pool is empty: scan a folder")
+        elif missing:
+            more = f" (+{len(missing) - 1} more)" if len(missing) > 1 else ""
+            _issue(issues, 'ERROR', f"Material pool: textures of {missing[0]}{more} are "
+                                    "missing; point Texture Folder at the library and scan")
+        if s.pool_variants:
+            if s.render_mode == 'CLAY':
+                _issue(issues, 'WARNING', "Variants only change Full renders")
+            elif scene.render.engine == 'BLENDER_WORKBENCH':
+                _issue(issues, 'WARNING', "Workbench barely shows textures")
     if s.export_croissant and not s.dataset_license:
         _issue(issues, 'WARNING', "Croissant: dataset has no licence set")
     if s.export_bop:
@@ -5919,6 +6562,7 @@ class MV_OT_RenderAll(Operator):
             remove_object(cam)
         reset_light_rig()
         remove_product_materials()
+        remove_pool_materials()
         ground = bpy.data.objects.get(GROUND_NAME)
         if ground is not None and getattr(self, "_ground_home", None) is not None:
             ground.location = self._ground_home
@@ -5948,7 +6592,8 @@ class MV_OT_RenderAll(Operator):
             coll = bpy.data.collections.get(product)
             if coll is not None:
                 s = context.scene.mv_settings
-                apply_product_material(s, coll, force=s.random_enabled and s.random_material)
+                apply_product_material(s, coll, force=(bool(self._pool) and takes_variants(coll))
+                                       or (s.random_enabled and s.random_material))
 
     def _stage(self, context, job, camera):
         """Turn the lights to this camera and stand the ground under this
@@ -6057,7 +6702,7 @@ class MV_OT_RenderAll(Operator):
             scene.world = random_world(path, rng.uniform(0.0, 2.0 * math.pi),
                                        rng.uniform(s.random_hdri_min, s.random_hdri_max))
 
-        if s.random_material and full:
+        if s.random_material and full and not job.get("variant"):
             rng = view_rng(s, label, view, 4)
             preset = RANDOM_MATERIALS[int(rng.integers(len(RANDOM_MATERIALS)))]
             preset_material(f"MV_Material_{job['product']}", preset, _random_colour(rng))
@@ -6162,9 +6807,12 @@ class MV_OT_RenderAll(Operator):
             self._labels.add(meta["label"])
             name = f"{meta['label']}_{pc.name}"
             first_job = len(self._queue)
-            sheet_cells = {mode: [] for mode, _, _ in modes}
+            sheet_cells = {}
             parts = part_list(pc)
             views = []
+            variants = (variant_assignments(s, meta["label"], sorted(parts), self._pool)
+                        if self._pool and takes_variants(pc) else [])
+            self._variants[pc.name] = variants
 
             for cam in cameras:
                 view = cam.name.replace("MV_Cam_", "")
@@ -6188,47 +6836,55 @@ class MV_OT_RenderAll(Operator):
                         "extra": (parts,) if mode == "parts" else (),
                     })
                 for mode, render, extra in modes:
-                    values = name_values(s, idx, pc.name, view, mode)
-                    rel_dir = output_folder(s, values)
-                    base = output_basename(s, values)
-                    path = os.path.join(root, rel_dir, base)
-                    self._claim(path)
-                    master = written_path(scene, path)
-                    post = self._post_targets(rel_dir, base) if s.post_enabled else []
-                    for target, _ in post:
-                        self._claim(target)
-                    rec = dict(meta, view=view, mode=mode)
-                    files[mode] = master
-                    sheet_cells[mode].append((view, post[0][0] if post else master))
+                    # Materials only show in Full renders; every other pass is
+                    # the same for each variant and is rendered once.
+                    choices = (variants if variants and render is _do_full_render
+                               else [("", None)])
+                    for vname, assignment in choices:
+                        values = name_values(s, idx, pc.name, view, mode, vname)
+                        rel_dir = output_folder(s, values)
+                        base = output_basename(s, values)
+                        path = os.path.join(root, rel_dir, base)
+                        self._claim(path)
+                        master = written_path(scene, path)
+                        post = self._post_targets(rel_dir, base) if s.post_enabled else []
+                        for target, _ in post:
+                            self._claim(target)
+                        rec = dict(meta, view=view, mode=mode, variant=vname,
+                                   materials=materials_text(assignment))
+                        files[f"{mode}@{vname}" if vname else mode] = master
+                        sheet_cells.setdefault((mode, vname), []).append(
+                            (view, post[0][0] if post else master))
 
-                    have_master = s.skip_existing and file_ok(master)
-                    if have_master:
-                        self._record(rec, "render", master, *self._render_size(scene))
-                        if all(file_ok(t) for t, _ in post):
-                            self._skipped += 1
-                            for target, _ in post:
-                                self._record(rec, "processed", target)
-                            continue
-                    self._queue.append({
-                        "kind": "post" if have_master else "render",
-                        "product": pc.name, "status": f"{name} {view}",
-                        "camera": cam.name, "render": render, "path": path,
-                        "master": master, "post": post, "rec": rec,
-                        "extra": extra,
-                    })
+                        have_master = s.skip_existing and file_ok(master)
+                        if have_master:
+                            self._record(rec, "render", master, *self._render_size(scene))
+                            if all(file_ok(t) for t, _ in post):
+                                self._skipped += 1
+                                for target, _ in post:
+                                    self._record(rec, "processed", target)
+                                continue
+                        self._queue.append({
+                            "kind": "post" if have_master else "render",
+                            "product": pc.name,
+                            "status": f"{name} {view}" + (f" {vname}" if vname else ""),
+                            "camera": cam.name, "render": render, "path": path,
+                            "master": master, "post": post, "rec": rec,
+                            "extra": extra, "variant": assignment,
+                        })
 
             if s.sheet_enabled:
                 touched = len(self._queue) > first_job
-                for mode, cells in sheet_cells.items():
-                    values = name_values(s, idx, pc.name, "Sheet", mode)
+                for (mode, vname), cells in sheet_cells.items():
+                    values = name_values(s, idx, pc.name, "Sheet", mode, vname)
                     path = os.path.join(root, output_folder(s, values),
                                         output_basename(s, values) + ".png")
                     self._claim(path)
-                    rec = dict(meta, view="Sheet", mode=mode)
+                    rec = dict(meta, view="Sheet", mode=mode, variant=vname)
                     if s.skip_existing and not touched and file_ok(path):
                         self._record(rec, "sheet", path)
                         continue
-                    title = f"{name}  ({mode})" if mode else name
+                    title = name + "".join(f"  ({t})" for t in (mode, vname) if t)
                     self._queue.append({"kind": "sheet", "status": f"{name} contact sheet",
                                         "path": path, "cells": cells, "title": title,
                                         "rec": rec})
@@ -6272,6 +6928,21 @@ class MV_OT_RenderAll(Operator):
 
             if s.turntable_enabled:
                 self._plan_turntable(context, idx, pc, meta)
+
+        # Patches belong to the pool, not to a product: with shards, the first
+        # shard makes them all and the others leave them alone, and rendering
+        # just the active product leaves them alone too.
+        if s.pool_patches and s.shard_suffix in {"", "_shard00"} and not self.only_active:
+            for pool_name, maps in pool_entries(s):
+                path = os.path.join(root, "materials", safe_name(pool_name) + "_patch.png")
+                self._claim(path)
+                rec = {"label": "materials", "product": pool_name, "view": "Patch", "mode": ""}
+                self._labels.add("materials")
+                if s.skip_existing and file_ok(path):
+                    self._record(rec, "patch", path)
+                    continue
+                self._queue.append({"kind": "patch", "status": f"material patch {pool_name}",
+                                    "path": path, "maps": maps, "name": pool_name, "rec": rec})
 
         if coco_sources:
             path = os.path.join(root, f"coco{s.shard_suffix}.json")
@@ -6331,6 +7002,9 @@ class MV_OT_RenderAll(Operator):
                 "render": _do_clay_render if clay else _do_full_render,
                 "extra": (tuple(s.clay_color),) if clay else (),
                 "rec": rec if not outputs else None,
+                # A Full-render turntable shows the first material variant.
+                "variant": (None if clay else
+                            next(iter(self._variants.get(pc.name) or []), (None, None))[1]),
             })
         if outputs:
             self._queue.append({"kind": "turn_encode", "product": pc.name,
@@ -6368,6 +7042,13 @@ class MV_OT_RenderAll(Operator):
         self._started_at = datetime.now()
         self._random = None
         self._cam_restore = None
+        self._variants = {}
+        # A job file or a fresh scene may name the folder without having
+        # scanned it, and a moved library leaves the list pointing at files
+        # that have gone; either way the folder is read again now.
+        if s.pool_variants or s.pool_patches:
+            refresh_pool(s)
+        self._pool = pool_entries(s) if s.pool_variants else []
         self._cancelled = False
         self._aborted = False
 
@@ -6500,6 +7181,9 @@ class MV_OT_RenderAll(Operator):
         if cam is None or cam.type != 'CAMERA':
             raise RuntimeError(f"camera '{camera}' no longer exists")
         scene.camera = cam
+        if job.get("variant"):
+            apply_variant(scene.mv_settings, bpy.data.collections[job["product"]],
+                          job["variant"], self._pool)
         self._stage(context, job, cam)
         started = time.monotonic()
         try:
@@ -6562,7 +7246,7 @@ class MV_OT_RenderAll(Operator):
             if record["projection"] != "perspective":
                 continue
             image = next((p for m, p in entry["files"].items()
-                          if m in {"", "render", "clay"}), None)
+                          if m.split("@")[0] in {"", "render", "clay"}), None)
             if image is None:
                 continue
             (fx, _, cx), (_, fy, cy), _ = record["K"]
@@ -6600,6 +7284,11 @@ class MV_OT_RenderAll(Operator):
         if frames:
             self._write_json(job["transforms"], {"camera_model": "OPENCV", "frames": frames})
             self._record(meta, "cameras", job["transforms"])
+
+    def _job_patch(self, context, job):
+        s = context.scene.mv_settings
+        size = render_patch(context, job["name"], job["maps"], job["path"], s.patch_size)
+        self._record(job["rec"], "patch", job["path"], *size)
 
     def _job_drawing(self, context, job):
         s = context.scene.mv_settings
@@ -6682,7 +7371,8 @@ class MV_OT_RenderAll(Operator):
             cam = bpy.data.objects.get(entry["camera"])
             if cam is None or cam.data.type != 'PERSP':
                 continue
-            rgb = next((p for m, p in entry["files"].items() if m in {"", "render", "clay"}), None)
+            rgb = next((p for m, p in entry["files"].items()
+                        if m.split("@")[0] in {"", "render", "clay"}), None)
             depth_exr = entry["files"].get("depth")
             if not rgb or not depth_exr or not file_ok(rgb) or not file_ok(depth_exr):
                 continue
@@ -6822,7 +7512,7 @@ class MV_OT_RenderAll(Operator):
                         "part_id": int(part_id), "part_name": names.get(int(part_id), ""),
                     })
                 for mode, path in entry["files"].items():
-                    if mode not in {"", "render", "clay"} or not file_ok(path):
+                    if mode.split("@")[0] not in {"", "render", "clay"} or not file_ok(path):
                         continue
                     image_id = len(images) + 1
                     images.append({"id": image_id, "width": w, "height": h,
@@ -6965,6 +7655,7 @@ class MV_OT_RenderAll(Operator):
             "turn_encode": self._job_turn_encode, "cameras": self._job_cameras,
             "turn_cameras": self._job_turn_cameras, "bop": self._job_bop,
             "coco": self._job_coco, "drawing": self._job_drawing,
+            "patch": self._job_patch,
         }[job["kind"]]
         try:
             handler(context, job)
@@ -7181,6 +7872,20 @@ class MV_UL_CustomViews(UIList):
         row.operator("mv.remove_custom_view", text="", icon='X').index = index
 
 
+class MV_UL_Pool(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.prop(item, "enabled", text="")
+        sub = row.row(align=True)
+        sub.active = item.enabled
+        sub.label(text=item.name, icon='MATERIAL')
+        try:
+            maps = json.loads(item.maps)
+        except ValueError:
+            maps = {}
+        sub.label(text="".join(sorted({MAP_LETTERS.get(k, "") for k in maps})))
+
+
 class MV_UL_Products(UIList):
     """MV_Products' children, each with its render tick and the label its
     files will carry. The label is worked out from the product's place in the
@@ -7293,6 +7998,46 @@ class MV_PT_SceneMaterials(Panel):
         sub.prop(coll, "mv_material_color", text="")
         layout.label(text="Full renders only. Pick a product in", icon='INFO')
         layout.label(text="Products to render to set its own.")
+
+
+class MV_PT_ScenePool(Panel):
+    bl_label = "Material Pool"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "MultiView"
+    bl_parent_id = "MV_PT_SceneSetup"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.mv_settings
+        row = layout.row(align=True)
+        row.prop(s, "pool_folder", text="")
+        row.operator("mv.scan_pool", text="", icon='FILE_REFRESH')
+        if s.material_pool:
+            row = layout.row()
+            row.template_list("MV_UL_Pool", "", s, "material_pool", s, "material_pool_index",
+                              rows=4)
+            col = row.column(align=True)
+            col.operator("mv.set_pool", text="", icon='CHECKBOX_HLT').state = True
+            col.operator("mv.set_pool", text="", icon='CHECKBOX_DEHLT').state = False
+            layout.label(text="C colour  R rough  M metal  A packed  H height  N normal",
+                         icon='INFO')
+        layout.prop(s, "pool_tile_mm")
+
+        box = layout.box()
+        box.label(text="Product variants (Full renders):")
+        row = box.row(align=True)
+        row.prop(s, "pool_variants")
+        row.prop(s, "pool_seed")
+        box.prop(s, "pool_per_part")
+
+        box = layout.box()
+        box.label(text="Material patches:")
+        row = box.row(align=True)
+        row.prop(s, "pool_patches", text="With Render All")
+        row.prop(s, "patch_size", text="Size")
+        box.operator("mv.render_patches", icon='MATSPHERE')
 
 
 class MV_PT_Import(Panel):
@@ -7612,7 +8357,7 @@ class MV_PT_RenderNaming(_RenderSubPanel, Panel):
         layout.prop(s, "file_template")
         col = layout.column(align=True)
         col.label(text="Tokens: {label} {prefix} {number}")
-        col.label(text="{product} {view} {mode}")
+        col.label(text="{product} {view} {mode} {variant}")
 
         # The first image of the batch, as it will actually be written.
         prods = get_products()
@@ -7834,6 +8579,7 @@ classes = (
     MV_AddonPreferences,
     MV_StepFileItem,
     MV_Issue,
+    MV_PoolMaterial,
     MV_CustomView,
     MV_Settings,
     MV_OT_AddStepFile,
@@ -7845,6 +8591,9 @@ classes = (
     MV_OT_BuildCameras,
     MV_OT_BuildLighting,
     MV_OT_ApplyWorld,
+    MV_OT_ScanPool,
+    MV_OT_SetPool,
+    MV_OT_RenderPatches,
     MV_OT_SaveLightingPreset,
     MV_OT_DeleteLightingPreset,
     MV_OT_AddCustomView,
@@ -7864,10 +8613,12 @@ classes = (
     MV_UL_StepFiles,
     MV_UL_CustomViews,
     MV_UL_Products,
+    MV_UL_Pool,
     # Panels draw in the sidebar in the order they are registered.
     MV_PT_Guide,
     MV_PT_SceneSetup,
     MV_PT_SceneMaterials,
+    MV_PT_ScenePool,
     MV_PT_Import,
     MV_PT_Standardize,
     MV_PT_Cameras,
