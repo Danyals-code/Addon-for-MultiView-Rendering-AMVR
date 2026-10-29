@@ -1,24 +1,28 @@
 cff-version: 1.2.0
 message: "If you use MultiView Product Renderer in your research, please cite it as below."
-title: "MultiView Product Renderer"
+title: "CADshot"
 type: software
 authors:
   - given-names: Danyal
     family-names: Sarfraz
-version: 1.12.0
+version: 1.13.0
 license: MIT
 repository-code: "https://github.com/Danyals-code/Addon-for-MultiView-Rendering-AMVR"
 abstract: >-
-  A Blender add-on that turns CAD (STEP, IGES) and mesh files into standardized
-  multi-view image sets and datasets: canonical camera rigs or published
-  protocols, studio lighting, clay, line-art, depth, normal and part-ID passes,
-  camera poses, COCO and BOP annotations, vector engineering drawings, seeded
-  randomization, and a provenance manifest with Croissant metadata.
+  A Blender add-on that turns CAD (STEP, IGES) and mesh files into three kinds of
+  standardized image set: multiple clay views of a product's form, patches of the
+  materials in a texture pool, and products rendered across every combination of
+  view and texture. Canonical camera rigs or published protocols, studio lighting,
+  clay, line-art, depth, normal and part-ID passes, camera poses, COCO and BOP
+  annotations, vector engineering drawings, seeded randomization, and a provenance
+  manifest with Croissant metadata. Formerly MultiView Product Renderer.
 keywords:
   - Blender
   - CAD
   - STEP
   - multi-view rendering
+  - material patches
+  - CMF
   - synthetic data
   - dataset generation
   - engineering drawings

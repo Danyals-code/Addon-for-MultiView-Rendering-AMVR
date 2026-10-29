@@ -220,12 +220,14 @@ def run_job(mv, args):
         for i, pc in enumerate(mv.get_products()):
             pc.mv_label_index = i
             pc.mv_render = pc.mv_render and i % count == index
-    if not mv.get_products():
+    # The Patches part renders the texture pool, not the products, so a job
+    # that asks for it needs no inputs at all.
+    if not mv.get_products() and s.part != 'PATCHES':
         raise JobError("no products to render")
 
-    if job.get("standardize"):
+    if job.get("standardize") and mv.get_products():
         bpy.ops.mv.standardize()
-    if job.get("auto_orient"):
+    if job.get("auto_orient") and mv.get_products():
         method = job["auto_orient"]
         if isinstance(method, str):
             s.orient_method = method.upper()

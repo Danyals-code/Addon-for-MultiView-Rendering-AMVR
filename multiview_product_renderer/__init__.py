@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "MultiView Product Renderer",
+    "name": "CADshot",
     "author": "Danyal Sarfraz",
-    "version": (1, 12, 0),
+    "version": (1, 13, 0),
     "blender": (4, 0, 0),
-    "location": "View3D > Sidebar > MultiView",
-    "description": "Import CAD and mesh files, set up cameras and studio lighting, batch render products across views.",
+    "location": "View3D > Sidebar > CADshot",
+    "description": "Three image sets from CAD: clay views of the form, patches of the materials, and products rendered in every texture.",
     "category": "Render",
 }
 
@@ -102,6 +102,49 @@ LIGHTING_PRESETS = {
 USER_PRESET_PREFIX = "USER:"
 LIGHT_RIG = "MV_LightRig"
 
+# -- material patches ----------------------------------------------------------
+#
+# A patch shows one material on several shapes, under several lighting
+# conditions, composited into one grid: shapes across, lighting down. Each
+# tile is rendered in a scene of its own, so nothing here touches the user's.
+#
+# The shapes are sized to sit inside a sphere of PATCH_EXTENT, and the lighting
+# comes from the same presets the Stage panel uses. Presets store positions and
+# sizes as multiples of the subject's size, so a one-unit patch subject takes
+# them as they are: a swatch under Studio Soft is lit the way a product scaled
+# to a Target Size of 1.0 is lit under Studio Soft.
+
+PATCH_SHAPES = [
+    ('FLAT', "Flat", "One repeat of the texture seen straight on, filling the tile: "
+                     "colour and pattern scale as authored"),
+    ('SPHERE', "Sphere", "Continuous curvature, one highlight and a falloff to the "
+                         "terminator"),
+    ('CUBE', "Cube", "Three faces at once, so the box projection's seams show honestly"),
+    ('CYLINDER', "Cylinder", "A sweep in one axis only, as most machined parts are"),
+]
+PATCH_SHAPE_LABELS = {k: label for k, label, _ in PATCH_SHAPES}
+# The diameter of the sphere every non-flat subject is built to sit inside, so
+# one camera frames them all identically and they can be compared tile to tile.
+PATCH_EXTENT = 0.9
+# Margin left around that sphere in its tile.
+PATCH_PADDING = 1.1
+
+# Where the patch camera stands for the solid shapes: a three-quarter view, so
+# a cube shows three faces. The flat swatch gets a straight-on orthographic
+# camera of its own instead. Looking from -Y matches the direction a lighting
+# preset is laid out against, so a preset's key light lands where it should.
+PATCH_VIEW_DIR = (0.62, -1.0, 0.52)
+# Enough ambient that an unlit side is not pure black; the lamps do the work.
+PATCH_WORLD_GREY = 0.18
+
+# Stands in when no lighting condition is ticked, and reproduces the patch
+# every version before this one rendered.
+PATCH_STUDIO = [
+    {"name": "Key", "type": 'AREA', "pos": (1.6, -1.6, 2.0), "size": 1.5, "energy": 250.0},
+    {"name": "Fill", "type": 'AREA', "pos": (-2.0, -1.2, 0.8), "size": 1.5, "energy": 70.0},
+    {"name": "Rim", "type": 'AREA', "pos": (0.0, 2.2, 1.8), "size": 1.5, "energy": 150.0},
+]
+
 MATERIAL_PRESETS = {
     "MATTE_PLASTIC":  {"label": "Matte Plastic",  "inputs": {"Roughness": 0.55}},
     "GLOSSY_PLASTIC": {"label": "Glossy Plastic", "inputs": {"Roughness": 0.12, "Coat Weight": 0.4}},
@@ -125,6 +168,8 @@ UNIT_TO_MM = {"um": 0.001, "mm": 1.0, "cm": 10.0, "m": 1000.0, "in": 25.4, "ft":
 # are not here; neither are empties, which only carry a transform.
 GEOMETRY_TYPES = {'MESH', 'CURVE', 'SURFACE', 'META', 'FONT'}
 
+TOOL_NAME = "CADshot"
+
 CAMERA_COLL = "MV_Cameras"
 LIGHT_COLL = "MV_Lighting"
 PRODUCT_COLL = "MV_Products"
@@ -133,41 +178,90 @@ DISTRACTOR_COLL = "MV_Distractors"
 WORLD_NAME = "MV_World"
 GROUND_NAME = "MV_Ground"
 
-GUIDE_LINES = [
-    "1. Scene Setup: pick lighting (or save your own with +), a colour or",
-    "   HDRI background and a ground, then Apply. Materials sets preset",
-    "   materials for Full renders, for the batch or one product.",
-    "2. Import: add files or a whole folder, then click Import. STEP and",
-    "   IGES need FreeCAD (STEP can use STEPper); STL, OBJ, PLY, glTF,",
-    "   FBX and 3MF are meshes and import directly. Each file becomes a",
-    "   collection under MV_Products; STEP parts keep names and colours.",
-    "   You can also create empty product collections and drop meshes in.",
-    "3. Standardize: centre and scale every product, to one size each or",
-    "   keeping their real proportions, and fix the faceted shading a CAD",
-    "   tessellation arrives with. Fit on Import does it as each file lands.",
-    "4. Cameras: pick a view set (or Custom and tick views), front axis,",
-    "   click Build. Then use Orient Products to walk the batch one at a",
-    "   time: Auto Orient lays products flat, Reset undoes any turning.",
-    "5. Render: set output folder, mode (full/clay/both), starting index,",
-    "   tick the products you want, then Render All or Render Active.",
-    "   Pre-flight checks the batch first and offers one-click fixes.",
-    "   Esc stops after the current image; Skip Existing resumes.",
-    "   Cameras are reframed first. Files are named PREFIX_NN_Product_View,",
-    "   or however the Naming templates say.",
-    "   Optional extras under Batch Render: contact sheets, turntables",
-    "   (MP4/GIF), post-processed copies, and a CSV/JSON manifest.",
-    "   Annotations adds cameras.json/transforms.json, depth, normals,",
-    "   part IDs, COCO and BOP for building datasets. Drawings writes",
-    "   1:1 SVG three-views with hidden lines; Randomize varies images",
-    "   for training data, seeded. Cameras > Protocol matches published rigs.",
+# One short guide per part, since each uses a different half of the tool and
+# a single list of steps would describe panels the active part is not showing.
+PART_GUIDES = {
+    'CLAY': [
+        "Clay views: each product's form, from every view, with",
+        "no materials and nothing to read around it.",
+        "",
+        "1. Products: add files or a folder, click Import. STEP and",
+        "   IGES need FreeCAD (STEP can use STEPper); STL, OBJ, PLY,",
+        "   glTF, FBX and 3MF import directly. Each file becomes a",
+        "   collection under MV_Products, parts keeping CAD names.",
+        "   Or add an empty product collection and drop meshes in.",
+        "2. Standardize: centre and scale every product, to one size",
+        "   each or keeping their real proportions, and fix the",
+        "   faceted shading a CAD tessellation arrives with.",
+        "3. Views: pick a view set and front axis, click Build.",
+        "   Orient Products walks the batch one at a time: Auto",
+        "   Orient lays each flat, Reset undoes any turning.",
+        "4. Output: set the folder, tick the products you want, then",
+        "   Render Clay Views. Esc stops after the current image;",
+        "   Skip Existing resumes an interrupted run.",
+        "",
+        "Workbench draws clay with its own studio light, and the",
+        "ground is left out of it, so neither needs setting up.",
+    ],
+    'PATCHES': [
+        "Material patches: one image per material in the pool, a",
+        "grid of the shapes you tick across and the lighting",
+        "conditions you tick down.",
+        "",
+        "1. Texture Pool: point Texture Folder at a library with one",
+        "   sub-folder per material, as downloaded from ambientCG or",
+        "   Poly Haven, and click the refresh button. Every folder",
+        "   with a colour map becomes a material. Untick any you do",
+        "   not want.",
+        "2. Patch: tick the shapes (flat swatch, sphere, cube,",
+        "   cylinder) and the lighting conditions. The lighting list",
+        "   is the same presets Stage uses, including any you saved",
+        "   there; refresh it to pick up new ones. Three shapes and",
+        "   three lightings is nine tiles in one image.",
+        "3. Output: set the folder, then Render Material Patches.",
+        "   They are written to materials/ inside it.",
+        "",
+        "A preset is stored relative to the subject's size, so a",
+        "swatch under Studio Soft is lit the way a product at a",
+        "Target Size of 1.0 is lit under Studio Soft.",
+        "",
+        "This part needs no product and no camera: patches are",
+        "rendered in a scene of their own, and yours is left exactly",
+        "as it was.",
+    ],
+    'VARIANTS': [
+        "Texture variants: every product rendered several times",
+        "over, each with a different draw from the pool.",
+        "",
+        "1. Products: import as for clay views. A product set to",
+        "   Keep Own is left out and renders once, in its own",
+        "   materials.",
+        "2. Standardize and 3. Views: as for clay views.",
+        "4. Stage: lighting, background and ground all show here,",
+        "   because these are Full renders.",
+        "5. Texture Pool: scan a texture library, as for patches.",
+        "6. Variants: how many draws per product, the seed, and",
+        "   whether each part draws its own material or the whole",
+        "   product shares one.",
+        "7. Output: Render Texture Variants. Files get a _v01, _v02",
+        "   suffix, and the manifest records what each one wears.",
+        "",
+        "Draws come from the seed, the product and the part, so a",
+        "re-run gives the same variants. Adding products, variants",
+        "or parts never changes the other draws.",
+    ],
+}
+
+GUIDE_FOOTER = [
     "",
     "Headless: blender -b --python multiview_product_renderer/cli.py",
     "  -- --config job.json   (see README, Command line)",
-    "   Only products are hidden between shots, so anything outside",
-    "   MV_Products lands in every image. The panel warns you first.",
     "",
-    "Render engine, samples, resolution and file format stay under your",
-    "control in Blender's Output and Render properties.",
+    "Only products are hidden between shots, so anything outside",
+    "MV_Products lands in every image. The panel warns you first.",
+    "",
+    "Render engine, samples, resolution and file format stay under",
+    "your control in Blender's Output and Render properties.",
 ]
 
 
@@ -257,7 +351,7 @@ VIEW_PROTOCOLS = {
     'GS1_15': {
         "label": "Catalogue, 15 degree plunge",
         "source": "After the GS1 Product Image Specification's preferred 15 degree plunge for "
-                  "3D images; view names are MultiView's, not GS1 file codes",
+                  "3D images; the view names are this add-on's, not GS1 file codes",
         "make": lambda rng: [("Front_0", sphere_dir(0, 0), None),
                              ("Front_15", sphere_dir(0, 15), None),
                              ("FrontRight_15", sphere_dir(45, 15), None),
@@ -423,6 +517,14 @@ class MV_PoolMaterial(PropertyGroup):
                         options={'HIDDEN'})
 
 
+class MV_PatchLight(PropertyGroup):
+    key: StringProperty(description="Lighting preset key, built-in or saved",
+                        options={'HIDDEN'})
+    name: StringProperty(name="Name")
+    enabled: BoolProperty(name="Use", default=False,
+                          description="Give the patch a row under this lighting")
+
+
 class MV_Issue(PropertyGroup):
     severity: StringProperty()
     message: StringProperty()
@@ -461,7 +563,78 @@ def _update_view_set(self, context):
     self.views_enabled = [v[0] in names for v in VIEWS_ALL]
 
 
+# -- the three parts ---------------------------------------------------------
+#
+# The add-on makes three kinds of image set, and each needs a different half
+# of the tool. Clay views need products and a camera rig and ignore materials
+# altogether. Material patches need the texture pool and nothing else -- no
+# product, no camera, no lighting. Texture variants need both halves at once.
+# The sidebar shows one part at a time: every panel polls on the active part,
+# so a mode only ever shows what it can actually use.
+#
+# The part is not where the render state lives. It writes through to
+# render_mode, pool_variants and pool_patches, which stay the properties the
+# renderer, the command line, the manifest and the provenance snapshot read,
+# so nothing downstream has to learn that parts exist.
+
+PART_ITEMS = [
+    ('CLAY', "Clay", "Multiple clay views of each product: its form on its own, "
+                     "with no materials and no lighting to read around"),
+    ('PATCHES', "Patches", "One image per pool material: a flat swatch beside a lit "
+                           "ball. Needs only the texture pool"),
+    ('VARIANTS', "Variants", "Every product rendered several times over, each with a "
+                             "different draw of materials from the texture pool"),
+]
+# What each part is a dataset of, in the vocabulary of the paper.
+PART_FOCUS = {'CLAY': "Form", 'PATCHES': "CMF", 'VARIANTS': "CMF x Form"}
+# The render button's wording, and what the part is called in a message.
+PART_LABELS = {'CLAY': "Clay Views", 'PATCHES': "Material Patches",
+               'VARIANTS': "Texture Variants"}
+DEFAULT_VARIANTS = 4
+
+
+def _update_part(self, context):
+    """Point the render state at the part just picked.
+
+    This runs only when the part changes, so it sets a sensible starting
+    point rather than holding the mode's settings hostage: Clay can still be
+    switched to Full or Both afterwards from its own Output panel. What it
+    does guarantee is that a clay run cannot inherit a variant count left
+    behind by an earlier texture run, or the other way about.
+
+    A job file may set these properties directly and never name a part. If it
+    sets both, the part should come first, since this writes over what it
+    names -- except the variant count, which is only filled in when nothing
+    has asked for one.
+    """
+    if self.part == 'CLAY':
+        self.render_mode = 'CLAY'
+        self.pool_variants = 0
+        self.pool_patches = False
+    elif self.part == 'PATCHES':
+        self.pool_patches = True
+        self.pool_variants = 0
+        # The lighting list is built from presets on disk, so it is refreshed
+        # on the way in rather than left as another file or machine left it.
+        sync_patch_lighting(self)
+    else:
+        self.render_mode = 'FULL'
+        self.pool_patches = False
+        if self.pool_variants < 1:
+            self.pool_variants = DEFAULT_VARIANTS
+
+
 class MV_Settings(PropertyGroup):
+    part: EnumProperty(
+        name="Part",
+        description="Which of the three image sets to work on. The sidebar shows only "
+                    "the panels that part uses, and picking one sets the render mode "
+                    "and variant count to match",
+        items=PART_ITEMS,
+        default='CLAY',
+        update=_update_part,
+    )
+
     step_files: CollectionProperty(type=MV_StepFileItem)
     step_files_index: IntProperty(default=0)
 
@@ -621,12 +794,26 @@ class MV_Settings(PropertyGroup):
     )
     pool_patches: BoolProperty(
         name="Patches",
-        description="With Render All, also write one image per pool material: a flat "
-                    "swatch and a material ball side by side, in materials/",
+        description="With Render All, also write one image per pool material: the "
+                    "material on each ticked shape, under each ticked lighting "
+                    "condition, in materials/",
         default=False,
     )
-    patch_size: IntProperty(name="Patch Size", default=512, min=64, max=4096,
-                            description="Pixels per side of each half of a patch")
+    patch_size: IntProperty(name="Tile Size", default=512, min=64, max=4096,
+                            description="Pixels per side of each tile in a patch")
+    patch_shapes: BoolVectorProperty(
+        name="Shapes",
+        description="Which shapes the material is shown on, left to right across the patch",
+        size=len(PATCH_SHAPES),
+        default=tuple(k in {'FLAT', 'SPHERE'} for k, _, _ in PATCH_SHAPES),
+    )
+    patch_lighting: CollectionProperty(type=MV_PatchLight)
+    patch_lighting_index: IntProperty(default=0)
+    patch_labels: BoolProperty(
+        name="Labels", default=True,
+        description="Print the material's name across the top, the shapes along it and "
+                    "the lighting conditions down the side",
+    )
 
     render_output_dir: StringProperty(
         name="Output Directory", subtype='DIR_PATH', default="//renders/",
@@ -814,7 +1001,7 @@ class MV_Settings(PropertyGroup):
         name="License", description="Licence of the rendered dataset, e.g. CC-BY-4.0 or a URL")
     dataset_url: StringProperty(name="URL", description="Where the dataset is published")
     dataset_cite: StringProperty(
-        name="Cite As", description="BibTeX for the dataset. Empty cites MultiView itself")
+        name="Cite As", description="BibTeX for the dataset. Empty cites the tool itself")
     shard_suffix: StringProperty(
         description="Added to manifest, COCO and BOP model-info file names by the "
                     "command line, so shards rendered in parallel do not overwrite "
@@ -3482,14 +3669,217 @@ def apply_variant(settings, coll, assignment, entries):
             obj.update_tag()
 
 
+def patch_shape_keys(settings):
+    """[(key, label)] for the ticked patch shapes, in PATCH_SHAPES order.
+
+    Falls back to the flat swatch so a patch is never an empty grid; the
+    panel and pre-flight both say so before it comes to that.
+    """
+    found = [(k, label) for (k, label, _), on
+             in zip(PATCH_SHAPES, settings.patch_shapes) if on]
+    return found or [PATCH_SHAPES[0][:2]]
+
+
+def sync_patch_lighting(settings):
+    """Refresh the lighting list from the presets, keeping the ticks.
+
+    Built-ins first and saved ones after, the order the Stage dropdown shows
+    them in. 'No Lights (HDRI only)' is left out: a patch scene has no HDRI,
+    so it would render every swatch black.
+    """
+    ticks = {item.key: item.enabled for item in settings.patch_lighting}
+    settings.patch_lighting.clear()
+    available = [(k, v["label"]) for k, v in LIGHTING_PRESETS.items() if v["lights"]]
+    available += [(k, label) for k, (label, _) in sorted(user_lighting_presets().items())]
+    for key, label in available:
+        item = settings.patch_lighting.add()
+        item.key = key
+        item.name = label
+        item.enabled = ticks.get(key, False)
+    return len(settings.patch_lighting)
+
+
+def patch_lightings(settings):
+    """[(label, specs)] for the ticked lighting conditions.
+
+    With nothing ticked -- a fresh file, or a preset that has since been
+    deleted -- one row under the built-in studio rig, which is the patch
+    every version before lighting conditions existed rendered.
+    """
+    found = []
+    for item in settings.patch_lighting:
+        if not item.enabled:
+            continue
+        specs = lighting_specs(item.key)
+        if specs:
+            found.append((item.name, specs))
+    return found or [("Studio", PATCH_STUDIO)]
+
+
+def patch_subject(kind):
+    """(mesh, ortho scale or None) for one patch shape, centred on the origin.
+
+    An ortho scale means the shape wants the straight-on camera: only the flat
+    swatch does, so that one repeat of the texture fills its tile exactly.
+    Everything else is sized to sit inside PATCH_EXTENT and shares the
+    three-quarter camera, so the tiles of a row are framed alike.
+    """
+    import bmesh
+    if kind == 'FLAT':
+        mesh = bpy.data.meshes.new("MV_Patch_Flat")
+        mesh.from_pydata([(-0.5, -0.5, 0.0), (0.5, -0.5, 0.0),
+                          (0.5, 0.5, 0.0), (-0.5, 0.5, 0.0)], [], [(0, 1, 2, 3)])
+        mesh.update()
+        return mesh, 1.0
+
+    radius = PATCH_EXTENT * 0.5
+    bm = bmesh.new()
+    if kind == 'SPHERE':
+        bmesh.ops.create_uvsphere(bm, u_segments=96, v_segments=48, radius=radius)
+        smooth = bm.faces
+    elif kind == 'CUBE':
+        # A cube's diagonal is what has to fit, not its side.
+        bmesh.ops.create_cube(bm, size=PATCH_EXTENT / math.sqrt(3.0))
+        smooth = []
+    else:
+        # Sized so its own corner-to-centre distance still lands inside the
+        # shared bounding sphere: sqrt(r^2 + (d/2)^2) <= radius.
+        bmesh.ops.create_cone(bm, cap_ends=True, cap_tris=False, segments=64,
+                              radius1=radius * 0.66, radius2=radius * 0.66,
+                              depth=PATCH_EXTENT * 0.72)
+        # The caps are flat and the wall is round: smoothing both together
+        # would bend the rim and lose the edge the highlight runs along.
+        # Chosen here, while the axis is still Z and the caps are the only
+        # faces pointing along it.
+        smooth = [f for f in bm.faces if abs(f.normal.z) < 0.9]
+    for face in smooth:
+        face.smooth = True
+    if kind == 'CYLINDER':
+        # Laid on its side. Standing up, every wall normal is horizontal while
+        # a preset's lights are all above, so the lower half of the wall turns
+        # away from all of them at once and the base goes black -- correct
+        # light, useless swatch. On its side the sweep runs under the key and
+        # the falloff reads as the form instead.
+        bmesh.ops.rotate(bm, verts=bm.verts, cent=(0.0, 0.0, 0.0),
+                         matrix=Matrix.Rotation(math.radians(90.0), 3, 'Y'))
+    mesh = bpy.data.meshes.new(f"MV_Patch_{kind.title()}")
+    bm.to_mesh(mesh)
+    bm.free()
+    return mesh, None
+
+
+def build_patch_lights(scene, specs, intensity=1.0):
+    """Light a patch scene from a lighting preset's specs. Returns what it made.
+
+    The same arithmetic build_lighting does for a product, with the subject's
+    size taken as one unit and no front-axis turn, since the patch camera is
+    fixed. That is what makes a swatch under a preset match a product render
+    under the same preset at a Target Size of 1.0.
+    """
+    made = []
+    for spec in specs:
+        kind = spec.get("type", 'AREA')
+        light = bpy.data.lights.new(f"MV_Patch_{spec.get('name', 'Light')}", type=kind)
+        size = spec.get("size", 1.0) * 0.5
+        if kind == 'AREA':
+            light.size = size
+            if "shape" in spec:
+                light.shape = spec["shape"]
+                light.size_y = spec.get("size_y", spec.get("size", 1.0)) * 0.5
+        elif kind in {'POINT', 'SPOT'}:
+            light.shadow_soft_size = size
+        if kind == 'SPOT':
+            light.spot_size = spec.get("spot_size", light.spot_size)
+            light.spot_blend = spec.get("spot_blend", light.spot_blend)
+        if kind == 'SUN':
+            light.angle = spec.get("angle", light.angle)
+        light.energy = float(spec["energy"]) * intensity
+        light.color = spec.get("color", (1.0, 1.0, 1.0))
+
+        obj = bpy.data.objects.new(light.name, light)
+        scene.collection.objects.link(obj)
+        pos = Vector(spec["pos"])
+        if "rot" in spec:
+            obj.matrix_world = (Matrix.Translation(pos)
+                                @ Quaternion(spec["rot"]).to_matrix().to_4x4())
+        else:
+            obj.matrix_world = look_at(pos, Vector((0.0, 0.0, 0.0)))
+        made += [obj, light]
+    return made
+
+
+def patch_grid(tiles, rows, columns, title, size, labels, tmp_dir):
+    """Composite a material's tiles into one image: shapes across, lighting down.
+
+    tiles is {(row label, column label): pixels}. Column headings run along
+    the top and row labels down the left, so a reader can tell which light and
+    which shape a tile is without counting.
+    """
+    gap = max(6, size // 32)
+    caption = max(11, size // 18)
+    title_h = int(caption * 2.2) if labels else 0
+    head_h = int(caption * 1.6) if labels else 0
+    side_w = (max([int(blf_width(r, caption)) for r in rows] + [0]) + gap
+              if labels else 0)
+
+    width = side_w + len(columns) * size + (len(columns) + 1) * gap
+    # The leading gap is counted once here and added to every row's offset
+    # below, so the margin above the first row matches the one below the last.
+    height = title_h + head_h + gap + len(rows) * (size + gap)
+    canvas = np.empty((height, width, 4), np.float32)
+    canvas[:] = (1.0, 1.0, 1.0, 1.0)
+    ink = np.array((0.1, 0.1, 0.1), np.float32)
+
+    def draw_text(text, text_size, x, y_top, max_w):
+        mask = text_mask(text, text_size, tmp_dir)
+        if mask is None:
+            return
+        mask = mask[:, :max(int(max_w), 1)]
+        layer = np.empty(mask.shape + (4,), np.float32)
+        layer[..., :3] = ink
+        layer[..., 3] = mask
+        paste_over(canvas, layer, int(x), height - int(y_top) - mask.shape[0])
+
+    if labels:
+        draw_text(title, int(caption * 1.5), gap, int(caption * 0.4), width - 2 * gap)
+        for col, name in enumerate(columns):
+            draw_text(name, caption, side_w + gap + col * (size + gap),
+                      title_h + int(caption * 0.2), size)
+
+    for row, row_name in enumerate(rows):
+        y_top = title_h + head_h + gap + row * (size + gap)
+        if labels:
+            draw_text(row_name, caption, gap, y_top + size // 2 - caption // 2, side_w)
+        for col, col_name in enumerate(columns):
+            px = tiles.get((row_name, col_name))
+            if px is None:
+                continue
+            x = side_w + gap + col * (size + gap)
+            paste_over(canvas, px, x, height - y_top - px.shape[0])
+    return canvas
+
+
+def blf_width(text, size):
+    """Width of text in the UI font, or a rough guess where blf cannot say."""
+    try:
+        blf.size(0, size)
+        return blf.dimensions(0, text)[0]
+    except Exception:
+        return len(text) * size * 0.55
+
+
 def render_patch(context, name, maps, path, size):
-    """One image per pool material: a flat swatch seen straight on, and a
-    ball under studio lights, side by side and labelled.
+    """One image per pool material: the material on each ticked shape, under
+    each ticked lighting condition, composited into a grid.
 
     Rendered in a scene of its own, so the user's scene is never touched.
-    Workbench cannot show textures properly, so Cycles stands in for it.
+    Workbench cannot show a texture properly, so Cycles stands in for it.
     """
     main = context.scene
+    s = main.mv_settings
+    shapes = patch_shape_keys(s)
+    lightings = patch_lightings(s)
+
     scene = bpy.data.scenes.new("MV_Patch")
     made = []
     work = tempfile.mkdtemp(prefix="mv_patch_")
@@ -3501,8 +3891,11 @@ def render_patch(context, name, maps, path, size):
             scene.cycles.device = main.cycles.device
         scene.render.resolution_x = scene.render.resolution_y = size
         scene.render.resolution_percentage = 100
-        scene.render.film_transparent = False
+        # Tiles are composited onto the grid's own white background, so each
+        # one is just the lit subject with nothing behind it.
+        scene.render.film_transparent = True
         scene.render.image_settings.file_format = 'PNG'
+        scene.render.image_settings.color_mode = 'RGBA'
         # The same colour management as the product renders, so a swatch shows
         # the material as it looks in them.
         scene.display_settings.display_device = main.display_settings.display_device
@@ -3519,74 +3912,83 @@ def render_patch(context, name, maps, path, size):
         bg = tree.nodes.new("ShaderNodeBackground")
         out = tree.nodes.new("ShaderNodeOutputWorld")
         tree.links.new(bg.outputs["Background"], out.inputs["Surface"])
+        bg.inputs["Color"].default_value = (PATCH_WORLD_GREY,) * 3 + (1.0,)
+        bg.inputs["Strength"].default_value = 1.0
         scene.world = world
 
-        def add(obj):
-            scene.collection.objects.link(obj)
-            made.append(obj)
-            if obj.data is not None:
-                made.append(obj.data)
-            return obj
+        # One camera for the solid shapes, framed on the sphere of PATCH_EXTENT
+        # that every one of them is built to sit inside. Framing on the shared
+        # sphere rather than on each shape's own silhouette is what makes the
+        # tiles comparable: each shape fills as much of its tile as its form
+        # allows, and the texture reads at one scale across the row.
+        radius = PATCH_EXTENT * 0.5
+        direction = Vector(PATCH_VIEW_DIR).normalized()
+        tan_x, tan_y = sensor_tangents(1.0, 1.0)
+        tan = min(tan_x, tan_y)
+        # A sphere touches the frame edge where the view angle is asin(r/d),
+        # not atan: using the tangent would leave it noticeably small.
+        distance = radius / (tan / math.sqrt(1.0 + tan * tan)) * PATCH_PADDING
 
-        def shoot(label):
-            scene.render.filepath = os.path.join(work, label)
-            bpy.ops.render.render(write_still=True, scene=scene.name)
-            return load_pixels(written_path(scene, scene.render.filepath))
+        solid_data = bpy.data.cameras.new("MV_Patch_View")
+        solid_data.lens = PERSP_LENS
+        solid_data.clip_start = max(distance * 0.01, 1e-5)
+        solid_data.clip_end = distance * 100.0
+        solid = bpy.data.objects.new("MV_Patch_View", solid_data)
+        solid.matrix_world = look_at(direction * distance, Vector((0.0, 0.0, 0.0)))
+        scene.collection.objects.link(solid)
+        made += [solid, solid_data]
 
-        # Flat swatch: one repeat of the texture filling the frame, lit evenly
-        # by a plain white environment.
-        bg.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
-        bg.inputs["Strength"].default_value = 1.0
-        plane_mesh = bpy.data.meshes.new("MV_Patch_Plane")
-        plane_mesh.from_pydata([(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)],
-                               [], [(0, 1, 2, 3)])
-        plane_mesh.materials.append(mat)
-        plane = add(bpy.data.objects.new("MV_Patch_Plane", plane_mesh))
-        plane[TILE_KEY] = 1.0
-        top_data = bpy.data.cameras.new("MV_Patch_Top")
-        top_data.type = 'ORTHO'
-        top_data.ortho_scale = 1.0
-        top = add(bpy.data.objects.new("MV_Patch_Top", top_data))
-        top.matrix_world = look_at(Vector((0, 0, 2)), Vector((0, 0, 0)))
-        scene.camera = top
-        flat = shoot("flat")
-        scene.collection.objects.unlink(plane)
+        flat_data = bpy.data.cameras.new("MV_Patch_Top")
+        flat_data.type = 'ORTHO'
+        flat_data.ortho_scale = 1.0
+        flat = bpy.data.objects.new("MV_Patch_Top", flat_data)
+        flat.matrix_world = look_at(Vector((0.0, 0.0, 2.0)), Vector((0.0, 0.0, 0.0)))
+        scene.collection.objects.link(flat)
+        made += [flat, flat_data]
 
-        # Ball: the same material on a sphere under a key, fill and rim light.
-        import bmesh
-        bg.inputs["Color"].default_value = (0.18, 0.18, 0.18, 1.0)
-        ball_mesh = bpy.data.meshes.new("MV_Patch_Ball")
-        bm = bmesh.new()
-        bmesh.ops.create_uvsphere(bm, u_segments=96, v_segments=48, radius=0.45)
-        for face in bm.faces:
-            face.smooth = True
-        bm.to_mesh(ball_mesh)
-        bm.free()
-        ball_mesh.materials.append(mat)
-        ball = add(bpy.data.objects.new("MV_Patch_Ball", ball_mesh))
-        ball[TILE_KEY] = 1.0
-        for label, pos, energy in (("Key", (1.6, -1.6, 2.0), 250.0),
-                                   ("Fill", (-2.0, -1.2, 0.8), 70.0),
-                                   ("Rim", (0.0, 2.2, 1.8), 150.0)):
-            light = bpy.data.lights.new(f"MV_Patch_{label}", type='AREA')
-            light.size = 1.5
-            light.energy = energy
-            obj = add(bpy.data.objects.new(f"MV_Patch_{label}", light))
-            obj.matrix_world = look_at(Vector(pos), Vector((0, 0, 0)))
-        cam_data = bpy.data.cameras.new("MV_Patch_View")
-        cam_data.lens = 50.0
-        view = add(bpy.data.objects.new("MV_Patch_View", cam_data))
-        view.matrix_world = look_at(Vector((0, -2.3, 1.0)), Vector((0, 0, 0)))
-        scene.camera = view
-        sphere = shoot("ball")
+        subjects = {}
+        for kind, _ in shapes:
+            mesh, ortho = patch_subject(kind)
+            mesh.materials.append(mat)
+            obj = bpy.data.objects.new(mesh.name, mesh)
+            # One repeat of the texture per unit, so the flat swatch shows
+            # exactly one and the solids show the pattern at the same scale.
+            obj[TILE_KEY] = 1.0
+            subjects[kind] = (obj, ortho)
+            made += [obj, mesh]
 
-        from types import SimpleNamespace
-        layout = SimpleNamespace(sheet_cell_width=size, sheet_columns=2, sheet_labels=True,
-                                 sheet_bg=(1.0, 1.0, 1.0, 1.0), sheet_text_color=(0.1, 0.1, 0.1))
-        sheet = contact_sheet([("Flat", flat), ("Ball", sphere)], name, layout, work)
+        tiles = {}
+        for light_label, specs in lightings:
+            lights = build_patch_lights(scene, specs, main.mv_settings.lighting_intensity)
+            try:
+                for kind, shape_label in shapes:
+                    obj, ortho = subjects[kind]
+                    scene.camera = flat if ortho is not None else solid
+                    scene.collection.objects.link(obj)
+                    try:
+                        scene.render.filepath = os.path.join(
+                            work, f"{len(tiles):03d}")
+                        bpy.ops.render.render(write_still=True, scene=scene.name)
+                        tiles[(light_label, shape_label)] = load_pixels(
+                            written_path(scene, scene.render.filepath))
+                    finally:
+                        scene.collection.objects.unlink(obj)
+            finally:
+                for block in lights:
+                    try:
+                        if isinstance(block, bpy.types.Object):
+                            bpy.data.objects.remove(block, do_unlink=True)
+                        else:
+                            bpy.data.lights.remove(block)
+                    except (ReferenceError, RuntimeError):
+                        pass
+
+        grid = patch_grid(tiles, [label for label, _ in lightings],
+                          [label for _, label in shapes], name, size,
+                          s.patch_labels, work)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        save_pixels(sheet, path, 'PNG')
-        return sheet.shape[1], sheet.shape[0]
+        save_pixels(grid, path, 'PNG')
+        return grid.shape[1], grid.shape[0]
     finally:
         bpy.data.scenes.remove(scene)
         for block in made:
@@ -3913,7 +4315,7 @@ class MV_OT_ImportAllSteps(Operator):
     def _status(self):
         name = os.path.basename(self._job_path) if self._job_path else ""
         waiting = " (converting)" if self._job is not None else ""
-        return f"MultiView: {self._done}/{self._total}  {name}{waiting}  -  Esc to cancel"
+        return f"{TOOL_NAME}: {self._done}/{self._total}  {name}{waiting}  -  Esc to cancel"
 
     def _report_result(self):
         if self._rescale_batch:
@@ -3936,7 +4338,7 @@ class MV_OT_ImportAllSteps(Operator):
             if len(self._problems) > 2:
                 msg += f" | +{len(self._problems) - 2} more (see system console)"
             for problem in self._problems:
-                print("[MultiView] " + problem)
+                print(f"[{TOOL_NAME}] " + problem)
         self.report(level, msg)
         return {'FINISHED'} if self._imported else {'CANCELLED'}
 
@@ -4087,9 +4489,35 @@ class MV_OT_SetPool(Operator):
         return {'FINISHED'}
 
 
+class MV_OT_SyncPatchLighting(Operator):
+    """Refresh the lighting conditions from the lighting presets, built-in and
+    saved, keeping whatever is already ticked"""
+    bl_idname = "mv.sync_patch_lighting"
+    bl_label = "Refresh Lighting List"
+
+    def execute(self, context):
+        found = sync_patch_lighting(context.scene.mv_settings)
+        self.report({'INFO'}, f"{found} lighting preset(s) available.")
+        return {'FINISHED'}
+
+
+class MV_OT_SetPatchLighting(Operator):
+    """Tick or untick every lighting condition"""
+    bl_idname = "mv.set_patch_lighting"
+    bl_label = "Set Lighting Conditions"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    state: BoolProperty(default=True)
+
+    def execute(self, context):
+        for item in context.scene.mv_settings.patch_lighting:
+            item.enabled = self.state
+        return {'FINISHED'}
+
+
 class MV_OT_RenderPatches(Operator):
-    """Render a flat swatch and a material ball for every ticked pool material,
-    into the output folder's materials/ folder"""
+    """Render every ticked pool material on each ticked shape, under each
+    ticked lighting condition, into the output folder's materials/ folder"""
     bl_idname = "mv.render_patches"
     bl_label = "Render Patches"
 
@@ -4109,7 +4537,7 @@ class MV_OT_RenderPatches(Operator):
                 written += 1
             except (RuntimeError, OSError) as exc:
                 failed.append(f"{name}: {exc}")
-                print(f"[MultiView] patch FAILED {name}: {exc}")
+                print(f"[{TOOL_NAME}] patch FAILED {name}: {exc}")
         remove_pool_materials()
         if failed:
             self.report({'WARNING'}, f"Wrote {written} patch(es); {len(failed)} failed, first: "
@@ -5047,7 +5475,7 @@ def drawing_svg(placed, title, unit, show_hidden=True, dimensions=True):
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{x1 - x0:.3f}{unit}" '
            f'height="{y1 - y0:.3f}{unit}" viewBox="{x0:.4f} {y0:.4f} {x1 - x0:.4f} {y1 - y0:.4f}">',
            f"<title>{title}</title>",
-           f'<desc>Scale 1:1, units {unit}. Generated by MultiView Product Renderer.</desc>',
+           f'<desc>Scale 1:1, units {unit}. Generated by {TOOL_NAME}.</desc>',
            f'<rect x="{x0:.4f}" y="{y0:.4f}" width="{x1 - x0:.4f}" height="{y1 - y0:.4f}" fill="white"/>']
     for lines, dx, dy in placed:
         if show_hidden and lines["hidden"]:
@@ -5804,9 +6232,9 @@ def tool_version():
 
 
 def tool_citation():
-    return ("@software{sarfraz_multiview_product_renderer, author = {Sarfraz, Danyal}, "
-            "title = {MultiView Product Renderer}, version = {%s}, url = {%s}, "
-            "license = {MIT}}" % (tool_version(), REPOSITORY_URL))
+    return ("@software{sarfraz_cadshot, author = {Sarfraz, Danyal}, "
+            "title = {%s}, version = {%s}, url = {%s}, "
+            "license = {MIT}}" % (TOOL_NAME, tool_version(), REPOSITORY_URL))
 
 
 def file_sha256(path):
@@ -5849,7 +6277,7 @@ def provenance(context, started):
     elif hasattr(scene, "eevee"):
         samples = getattr(scene.eevee, "taa_render_samples", None)
     return {
-        "tool": "MultiView Product Renderer", "version": tool_version(),
+        "tool": TOOL_NAME, "version": tool_version(),
         "repository": REPOSITORY_URL, "citeAs": tool_citation(),
         "blender": bpy.app.version_string, "blend_file": bpy.data.filepath or None,
         "engine": engine, "samples": samples,
@@ -5920,7 +6348,7 @@ def write_croissant(out_root, manifest_name, meta):
         "@context": CROISSANT_CONTEXT, "@type": "sc:Dataset",
         "name": meta.get("name") or os.path.basename(os.path.normpath(out_root)),
         "description": meta.get("description") or
-        "Multi-view renders made with MultiView Product Renderer.",
+        f"Multi-view renders made with {TOOL_NAME}.",
         "conformsTo": "http://mlcommons.org/croissant/1.0",
         "citeAs": meta.get("citeAs") or tool_citation(),
         "datePublished": datetime.now().date().isoformat(),
@@ -5929,8 +6357,8 @@ def write_croissant(out_root, manifest_name, meta):
         "recordSet": [{"@type": "cr:RecordSet", "@id": "outputs", "name": "outputs",
                        "description": "One row per file written, from the manifest.",
                        "field": fields}],
-        "rai:dataCollection": "Synthetic images rendered in Blender by MultiView Product "
-                              "Renderer from the CAD and mesh files named in source_file; "
+        "rai:dataCollection": f"Synthetic images rendered in Blender by {TOOL_NAME} "
+                              "from the CAD and mesh files named in source_file; "
                               "the settings used are in the manifest's provenance.",
         "rai:dataCollectionType": "Synthetic data",
         "rai:personalSensitiveInformation": "None: renders of manufactured products.",
@@ -6126,6 +6554,18 @@ def _random_colour(rng):
     return colorsys.hsv_to_rgb(rng.random(), rng.uniform(0.1, 0.9), rng.uniform(0.15, 0.95))
 
 
+def needs_lighting(settings):
+    """True when something in this run is lit by the scene.
+
+    Only a Full render reads the lamps, the world and the ground: clay comes
+    with Workbench's own studio light, and the line, mask, AO and data passes
+    each replace the lighting outright. The Stage panel asks this before
+    showing lighting controls, and pre-flight before warning about them.
+    """
+    return (settings.render_mode in {'FULL', 'BOTH'}
+            or (settings.turntable_enabled and settings.turntable_style == 'FULL'))
+
+
 def render_modes(settings):
     """(mode, render function, extra arguments) for every image each view gets."""
     s = settings
@@ -6262,12 +6702,18 @@ def preflight(context, only_active=False):
     s = scene.mv_settings
     issues = []
     products = get_products()
+    # The Patches part renders the pool into a scene of its own, so the
+    # product, camera, view, naming and lighting checks below have nothing to
+    # say about it. Only the pool and the output folder matter.
+    patches_only = s.part == 'PATCHES'
 
     # What will be rendered.
-    if not products:
+    if patches_only:
+        targets = []
+    elif not products:
         _issue(issues, 'ERROR', f"No products under {PRODUCT_COLL}")
         return issues
-    if only_active:
+    elif only_active:
         coll, idx = active_product(context)
         targets = [(label_index(idx, coll), coll)]
     else:
@@ -6278,7 +6724,8 @@ def preflight(context, only_active=False):
 
     # Output.
     image = scene.render.image_settings
-    if image.file_format == 'FFMPEG' or getattr(image, "media_type", 'IMAGE') == 'VIDEO':
+    if not patches_only and (image.file_format == 'FFMPEG'
+                             or getattr(image, "media_type", 'IMAGE') == 'VIDEO'):
         _issue(issues, 'ERROR', "Output format is video, not image")
     raw = s.render_output_dir
     # Absolute before probing: in an unsaved file // resolves to a relative
@@ -6300,34 +6747,35 @@ def preflight(context, only_active=False):
         elif probe != out and not os.path.isdir(out):
             _issue(issues, 'WARNING', "Output folder does not exist yet", fix='FOLDER')
 
-    # Cameras and views.
-    if s.reframe_on_render:
-        if not [v for v in planned_views(s) if Vector(v[2]).length >= 1e-9]:
-            _issue(issues, 'ERROR', "No views selected")
-    else:
-        cam_coll = bpy.data.collections.get(CAMERA_COLL)
-        if not cam_coll or not [o for o in cam_coll.objects if o.type == 'CAMERA']:
-            _issue(issues, 'ERROR', "No cameras (build, or Reframe)", fix='CAMERAS')
-        elif cam_coll.get("mv_framing") != framing_signature(context):
-            _issue(issues, 'WARNING', "Cameras out of date: may crop",
-                   fix='CAMERAS')
+    if not patches_only:
+        # Cameras and views.
+        if s.reframe_on_render:
+            if not [v for v in planned_views(s) if Vector(v[2]).length >= 1e-9]:
+                _issue(issues, 'ERROR', "No views selected")
+        else:
+            cam_coll = bpy.data.collections.get(CAMERA_COLL)
+            if not cam_coll or not [o for o in cam_coll.objects if o.type == 'CAMERA']:
+                _issue(issues, 'ERROR', "No cameras (build, or Reframe)", fix='CAMERAS')
+            elif cam_coll.get("mv_framing") != framing_signature(context):
+                _issue(issues, 'WARNING', "Cameras out of date: may crop",
+                       fix='CAMERAS')
 
-    # Names.
-    views = ([v[0] for v in planned_views(s)] if s.reframe_on_render else
-             [o.name.replace("MV_Cam_", "") for o in
-              getattr(bpy.data.collections.get(CAMERA_COLL), "objects", [])
-              if o.type == 'CAMERA'])
-    if _names_clash(s, targets, views + (["Sheet"] if s.sheet_enabled else []),
-                    [m for m, _, _ in render_modes(s)] + [m for m, _, _ in data_modes(s)]):
-        _issue(issues, 'ERROR', "Template gives two images one name")
+        # Names.
+        views = ([v[0] for v in planned_views(s)] if s.reframe_on_render else
+                 [o.name.replace("MV_Cam_", "") for o in
+                  getattr(bpy.data.collections.get(CAMERA_COLL), "objects", [])
+                  if o.type == 'CAMERA'])
+        if _names_clash(s, targets, views + (["Sheet"] if s.sheet_enabled else []),
+                        [m for m, _, _ in render_modes(s)] + [m for m, _, _ in data_modes(s)]):
+            _issue(issues, 'ERROR', "Template gives two images one name")
 
-    # Engine-specific passes and staging.
-    if s.pass_ao and not hasattr(scene, "cycles"):
-        _issue(issues, 'ERROR', "AO pass needs the Cycles add-on")
-    if (data_modes(s) or s.export_drawings) and not hasattr(scene, "cycles"):
-        _issue(issues, 'ERROR', "Data passes and drawings need Cycles")
-    if s.random_enabled and s.random_hdri and not hdri_files(s):
-        _issue(issues, 'WARNING', "Randomize: no HDRIs in the HDRI folder")
+        # Engine-specific passes and staging.
+        if s.pass_ao and not hasattr(scene, "cycles"):
+            _issue(issues, 'ERROR', "AO pass needs the Cycles add-on")
+        if (data_modes(s) or s.export_drawings) and not hasattr(scene, "cycles"):
+            _issue(issues, 'ERROR', "Data passes and drawings need Cycles")
+        if s.random_enabled and s.random_hdri and not hdri_files(s):
+            _issue(issues, 'WARNING', "Randomize: no HDRIs in the HDRI folder")
     if s.pool_variants or s.pool_patches:
         refresh_pool(s)
         missing = pool_missing(s)
@@ -6342,8 +6790,27 @@ def preflight(context, only_active=False):
                 _issue(issues, 'WARNING', "Variants only change Full renders")
             elif scene.render.engine == 'BLENDER_WORKBENCH':
                 _issue(issues, 'WARNING', "Workbench barely shows textures")
+        # A patch stands in Cycles when the scene's engine is Workbench, which
+        # cannot show a texture. Without the Cycles add-on there is nothing to
+        # stand in with, and the swap would raise mid-run instead.
+        if s.pool_patches and scene.render.engine == 'BLENDER_WORKBENCH' \
+                and not hasattr(scene, "cycles"):
+            _issue(issues, 'ERROR', "Patches need Cycles while the engine is Workbench")
+        if s.pool_patches:
+            # A saved preset deleted since it was ticked would otherwise drop
+            # a row out of every patch without saying so.
+            gone = [item.name for item in s.patch_lighting
+                    if item.enabled and not lighting_specs(item.key)]
+            if gone:
+                more = f" (+{len(gone) - 1} more)" if len(gone) > 1 else ""
+                _issue(issues, 'WARNING',
+                       f"Patch lighting '{gone[0]}'{more} cannot be read; skipped")
     if s.export_croissant and not s.dataset_license:
         _issue(issues, 'WARNING', "Croissant: dataset has no licence set")
+
+    if patches_only:
+        return issues
+
     if s.export_bop:
         if s.reframe_on_render:
             persp = [v for v in planned_views(s) if v[1] == "persp"]
@@ -6352,8 +6819,7 @@ def preflight(context, only_active=False):
                      if o.type == 'CAMERA' and o.data.type == 'PERSP']
         if not persp:
             _issue(issues, 'WARNING', "BOP uses perspective views; none selected")
-    full = any(fn is _do_full_render for _, fn, _ in render_modes(s)) or (
-        s.turntable_enabled and s.turntable_style == 'FULL')
+    full = needs_lighting(s)
     if full and s.ground_mode == 'SHADOW' and scene.render.engine != 'CYCLES':
         _issue(issues, 'WARNING', "Shadow Catcher needs Cycles")
     if full and s.world_mode == 'HDRI' and not os.path.isfile(bpy.path.abspath(s.hdri_path)):
@@ -6535,9 +7001,13 @@ class MV_OT_RenderAll(Operator):
 
     @classmethod
     def description(cls, context, properties):
+        part = context.scene.mv_settings.part
+        if part == 'PATCHES':
+            return "Render one patch for every ticked material in the pool"
+        what = PART_LABELS[part].lower()
         if properties.only_active:
-            return "Render only the active product, from every camera"
-        return "Render every ticked product, from every camera"
+            return f"Render {what} of the active product only, from every camera"
+        return f"Render {what} of every ticked product, from every camera"
 
     # -- state ------------------------------------------------------------
     def _save_state(self, context, products):
@@ -6931,8 +7401,10 @@ class MV_OT_RenderAll(Operator):
 
         # Patches belong to the pool, not to a product: with shards, the first
         # shard makes them all and the others leave them alone, and rendering
-        # just the active product leaves them alone too.
-        if s.pool_patches and s.shard_suffix in {"", "_shard00"} and not self.only_active:
+        # just the active product leaves them alone too -- unless patches are
+        # the whole point of the run, which is what the Patches part asks for.
+        if s.pool_patches and s.shard_suffix in {"", "_shard00"} \
+                and (self._patches_only or not self.only_active):
             for pool_name, maps in pool_entries(s):
                 path = os.path.join(root, "materials", safe_name(pool_name) + "_patch.png")
                 self._claim(path)
@@ -7052,12 +7524,23 @@ class MV_OT_RenderAll(Operator):
         self._cancelled = False
         self._aborted = False
 
+        # The Patches part renders the pool, not the products: a run needs no
+        # product, no camera and no stage, and planning one is the whole job.
+        # Going through here rather than through mv.render_patches is what
+        # gives patches the progress bar, Esc, Skip Existing and the manifest
+        # rows every other output already had.
+        self._patches_only = s.part == 'PATCHES'
+
         products = get_products()
-        if not products:
+        if self._patches_only:
+            targets = []
+            if not pool_entries(s):
+                self.report({'ERROR'}, "The material pool is empty: scan a texture folder.")
+                return {'CANCELLED'}
+        elif not products:
             self.report({'ERROR'}, f"No product collections under '{PRODUCT_COLL}'.")
             return {'CANCELLED'}
-
-        if self.only_active:
+        elif self.only_active:
             coll, idx = active_product(context)
             targets = [(label_index(idx, coll), coll)]
         else:
@@ -7079,7 +7562,7 @@ class MV_OT_RenderAll(Operator):
                 self.report({'ERROR'}, "Every product to render is empty.")
                 return {'CANCELLED'}
 
-        if s.reframe_on_render and not planned_views(s):
+        if s.reframe_on_render and not self._patches_only and not planned_views(s):
             self.report({'ERROR'}, "No views selected. Tick at least one view.")
             return {'CANCELLED'}
 
@@ -7100,35 +7583,39 @@ class MV_OT_RenderAll(Operator):
         remove_product_materials()
         context.view_layer.update()
 
-        # Rebuilt every run so it always matches the panel, and so Ground set
-        # to None clears one an earlier run left behind.
-        if s.ground_mode != 'NONE' or bpy.data.objects.get(GROUND_NAME):
-            ground = build_ground(context)
-            if ground is not None:
-                self._ground_home = ground.location.copy()
-                if s.ground_mode == 'SHADOW' and scene.render.engine != 'CYCLES':
-                    self._notes.append("Shadow Catcher needs Cycles; other engines "
-                                       "show the ground as a plain floor.")
-        self._random_setup(context)
-        if s.lights_follow_camera and bpy.data.collections.get(LIGHT_COLL) \
-                and bpy.data.objects.get(LIGHT_RIG) is None:
-            self._notes.append("Lights Follow Camera needs the lighting rebuilt once "
-                               "(Scene Setup > Lighting Only).")
+        # Patches are rendered in a scene of their own, so none of the staging
+        # below reaches them.
+        cameras = []
+        if not self._patches_only:
+            # Rebuilt every run so it always matches the panel, and so Ground set
+            # to None clears one an earlier run left behind.
+            if s.ground_mode != 'NONE' or bpy.data.objects.get(GROUND_NAME):
+                ground = build_ground(context)
+                if ground is not None:
+                    self._ground_home = ground.location.copy()
+                    if s.ground_mode == 'SHADOW' and scene.render.engine != 'CYCLES':
+                        self._notes.append("Shadow Catcher needs Cycles; other engines "
+                                           "show the ground as a plain floor.")
+            self._random_setup(context)
+            if s.lights_follow_camera and bpy.data.collections.get(LIGHT_COLL) \
+                    and bpy.data.objects.get(LIGHT_RIG) is None:
+                self._notes.append("Lights Follow Camera needs the lighting rebuilt once "
+                                   "(Views > Stage > Lighting Only).")
 
-        if s.reframe_on_render:
-            # Framing covers the whole batch, ticked or not, so re-rendering a
-            # single product later lands at the same scale as its run.
-            skipped = build_cameras(context)
-            if skipped:
-                self._notes.append("Skipped custom view(s) with a zero direction: "
-                                   + ", ".join(skipped) + ".")
+            if s.reframe_on_render:
+                # Framing covers the whole batch, ticked or not, so re-rendering a
+                # single product later lands at the same scale as its run.
+                skipped = build_cameras(context)
+                if skipped:
+                    self._notes.append("Skipped custom view(s) with a zero direction: "
+                                       + ", ".join(skipped) + ".")
 
-        cam_coll = bpy.data.collections.get(CAMERA_COLL)
-        cameras = [o for o in cam_coll.objects if o.type == 'CAMERA'] if cam_coll else []
-        if not cameras:
-            self._restore(context)
-            self.report({'ERROR'}, "No cameras. Build cameras first.")
-            return {'CANCELLED'}
+            cam_coll = bpy.data.collections.get(CAMERA_COLL)
+            cameras = [o for o in cam_coll.objects if o.type == 'CAMERA'] if cam_coll else []
+            if not cameras:
+                self._restore(context)
+                self.report({'ERROR'}, "No cameras. Build cameras first.")
+                return {'CANCELLED'}
 
         try:
             self._plan(context, targets, cameras)
@@ -7166,7 +7653,7 @@ class MV_OT_RenderAll(Operator):
         """
         note = f"{os.path.basename(path)}: {exc}"
         self._failures.append(note)
-        print(f"[MultiView] FAILED {note}")
+        print(f"[{TOOL_NAME}] FAILED {note}")
         if not self._landed:
             self._aborted = True
             self._queue.clear()
@@ -7195,7 +7682,7 @@ class MV_OT_RenderAll(Operator):
         self._render_time += time.monotonic() - started
         self._renders_done += 1
         self._done += 1
-        print(f"[MultiView] {self._processed()}/{self._total}: {scene.render.filepath}")
+        print(f"[{TOOL_NAME}] {self._processed()}/{self._total}: {scene.render.filepath}")
 
     def _job_render(self, context, job):
         self._render_image(context, job, job["camera"])
@@ -7258,7 +7745,7 @@ class MV_OT_RenderAll(Operator):
             frames.append(frame)
 
         payload = {
-            "generator": f"MultiView Product Renderer {'.'.join(map(str, bl_info['version']))}",
+            "generator": f"{TOOL_NAME} {'.'.join(map(str, bl_info['version']))}",
             "blender": bpy.app.version_string,
             "label": meta["label"], "product": meta["product"],
             "source_file": meta.get("source_file", ""),
@@ -7542,7 +8029,7 @@ class MV_OT_RenderAll(Operator):
         for i, ann in enumerate(annotations):
             ann["id"] = i + 1
         self._write_json(job["path"], {
-            "info": {"description": "MultiView Product Renderer part instances",
+            "info": {"description": f"{TOOL_NAME} part instances",
                      "date_created": datetime.now().isoformat(timespec="seconds")},
             "images": images, "annotations": annotations,
             "categories": sorted(categories.values(), key=lambda c: c["id"]),
@@ -7673,7 +8160,7 @@ class MV_OT_RenderAll(Operator):
         return self._total - len(self._queue)
 
     def _status(self):
-        text = f"MultiView: {self._processed()}/{self._total}"
+        text = f"{TOOL_NAME}: {self._processed()}/{self._total}"
         if self._queue:
             text += f"  {self._queue[0]['status']}"
         if self._renders_done:
@@ -7886,6 +8373,15 @@ class MV_UL_Pool(UIList):
         sub.label(text="".join(sorted({MAP_LETTERS.get(k, "") for k in maps})))
 
 
+class MV_UL_PatchLighting(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.prop(item, "enabled", text="")
+        sub = row.row(align=True)
+        sub.active = item.enabled
+        sub.label(text=item.name, icon='LIGHT')
+
+
 class MV_UL_Products(UIList):
     """MV_Products' children, each with its render tick and the label its
     files will carry. The label is worked out from the product's place in the
@@ -7903,148 +8399,59 @@ class MV_UL_Products(UIList):
         sub.label(text=f"{label}  {item.name}", icon='OUTLINER_COLLECTION')
 
 
-class MV_PT_Guide(Panel):
-    bl_label = "Guide"
+# -- panels -------------------------------------------------------------------
+#
+# The sidebar shows one part at a time: every panel polls on the active part,
+# so Clay never shows a texture control and Patches never shows a camera one.
+# A panel whose poll fails takes its sub-panels with it, which is what gets
+# the Patches screen down to three panels rather than eighteen.
+#
+# Lighting, the ground and the base material poll on needs_lighting() rather
+# than on the part, because Clay can be switched to Full or Both from its own
+# Output panel, and then they matter again.
+
+PRODUCT_PARTS = {'CLAY', 'VARIANTS'}
+POOL_PARTS = {'PATCHES', 'VARIANTS'}
+
+
+class _Sidebar:
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "MultiView"
-    bl_options = {'DEFAULT_CLOSED'}
+    bl_category = "CADshot"
+
+
+class _ProductPanel(_Sidebar):
+    """Shown for the two parts that photograph products."""
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.mv_settings.part in PRODUCT_PARTS
+
+
+class MV_PT_Mode(_Sidebar, Panel):
+    bl_label = "Part"
 
     def draw(self, context):
         layout = self.layout
-        box = layout.box()
-        for line in GUIDE_LINES:
+        s = context.scene.mv_settings
+        layout.row(align=True).prop(s, "part", expand=True)
+        row = layout.row()
+        row.alignment = 'CENTER'
+        row.label(text=f"{PART_LABELS[s.part]}   ({PART_FOCUS[s.part]})")
+
+
+class MV_PT_Guide(_Sidebar, Panel):
+    bl_label = "Guide"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        box = self.layout.box()
+        for line in PART_GUIDES[context.scene.mv_settings.part] + GUIDE_FOOTER:
             box.label(text=line)
 
 
-class MV_PT_SceneSetup(Panel):
-    bl_label = "Scene Setup"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "MultiView"
-
-    def draw(self, context):
-        layout = self.layout
-        s = context.scene.mv_settings
-
-        col = layout.column(align=True)
-        col.label(text="Lighting:")
-        row = col.row(align=True)
-        row.prop(s, "lighting_preset", text="")
-        row.operator("mv.save_lighting_preset", text="", icon='ADD')
-        row.operator("mv.delete_lighting_preset", text="", icon='REMOVE')
-        col.prop(s, "lighting_intensity", slider=True)
-        layout.prop(s, "lights_follow_camera")
-
-        col = layout.column(align=True)
-        col.label(text="Background:")
-        col.row(align=True).prop(s, "world_mode", expand=True)
-        if s.world_mode == 'HDRI':
-            col.prop(s, "hdri_path", text="")
-            row = col.row(align=True)
-            row.prop(s, "hdri_strength")
-            row.prop(s, "hdri_rotation")
-            col.prop(s, "hdri_visible")
-        col.prop(s, "transparent_bg")
-        row = col.row()
-        # The colour still shows behind an HDRI the camera is not shown.
-        row.enabled = not s.transparent_bg and not (s.world_mode == 'HDRI' and s.hdri_visible)
-        row.prop(s, "bg_color", text="")
-
-        col = layout.column(align=True)
-        col.label(text="Ground (Full renders):")
-        col.prop(s, "ground_mode", text="")
-        if s.ground_mode == 'FLOOR':
-            row = col.row(align=True)
-            row.prop(s, "ground_color", text="")
-            row.prop(s, "ground_roughness")
-        elif s.ground_mode == 'SHADOW' and context.scene.render.engine != 'CYCLES':
-            col.label(text="Shadow Catcher needs Cycles.", icon='ERROR')
-
-        layout.separator()
-        layout.operator("mv.apply_scene_setup", icon='SCENE_DATA')
-
-        row = layout.row(align=True)
-        row.operator("mv.build_lighting", text="Lighting Only", icon='LIGHT')
-        row.operator("mv.apply_world", text="Background Only", icon='WORLD')
-
-
-class MV_PT_SceneMaterials(Panel):
-    bl_label = "Materials"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "MultiView"
-    bl_parent_id = "MV_PT_SceneSetup"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        layout = self.layout
-        s = context.scene.mv_settings
-        layout.label(text="Whole batch:")
-        row = layout.row(align=True)
-        row.prop(s, "material_preset", text="")
-        sub = row.row(align=True)
-        sub.active = s.material_preset != 'KEEP'
-        sub.prop(s, "material_color", text="")
-
-        coll, _ = active_product(context)
-        if coll is None:
-            return
-        layout.label(text=f"{coll.name}:", icon='OUTLINER_COLLECTION')
-        row = layout.row(align=True)
-        row.prop(coll, "mv_material", text="")
-        sub = row.row(align=True)
-        sub.active = coll.mv_material not in {'DEFAULT', 'KEEP'}
-        sub.prop(coll, "mv_material_color", text="")
-        layout.label(text="Full renders only. Pick a product in", icon='INFO')
-        layout.label(text="Products to render to set its own.")
-
-
-class MV_PT_ScenePool(Panel):
-    bl_label = "Material Pool"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "MultiView"
-    bl_parent_id = "MV_PT_SceneSetup"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        layout = self.layout
-        s = context.scene.mv_settings
-        row = layout.row(align=True)
-        row.prop(s, "pool_folder", text="")
-        row.operator("mv.scan_pool", text="", icon='FILE_REFRESH')
-        if s.material_pool:
-            row = layout.row()
-            row.template_list("MV_UL_Pool", "", s, "material_pool", s, "material_pool_index",
-                              rows=4)
-            col = row.column(align=True)
-            col.operator("mv.set_pool", text="", icon='CHECKBOX_HLT').state = True
-            col.operator("mv.set_pool", text="", icon='CHECKBOX_DEHLT').state = False
-            layout.label(text="C colour  R rough  M metal  A packed  H height  N normal",
-                         icon='INFO')
-        layout.prop(s, "pool_tile_mm")
-
-        box = layout.box()
-        box.label(text="Product variants (Full renders):")
-        row = box.row(align=True)
-        row.prop(s, "pool_variants")
-        row.prop(s, "pool_seed")
-        box.prop(s, "pool_per_part")
-
-        box = layout.box()
-        box.label(text="Material patches:")
-        row = box.row(align=True)
-        row.prop(s, "pool_patches", text="With Render All")
-        row.prop(s, "patch_size", text="Size")
-        box.operator("mv.render_patches", icon='MATSPHERE')
-
-
-class MV_PT_Import(Panel):
-    bl_label = "Import Products"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "MultiView"
+class MV_PT_Products(_ProductPanel, Panel):
+    bl_label = "Products"
 
     def draw(self, context):
         layout = self.layout
@@ -8052,7 +8459,7 @@ class MV_PT_Import(Panel):
         addon = context.preferences.addons.get(__name__)
 
         box = layout.box()
-        box.label(text="STEP / IGES Importer:")
+        box.label(text="STEP / IGES importer:")
         if addon is not None:
             prefs = addon.preferences
             box.prop(prefs, "step_import_mode", text="Mode")
@@ -8071,29 +8478,58 @@ class MV_PT_Import(Panel):
         col.operator("mv.add_folder", text="", icon='FILE_FOLDER')
         col.operator("mv.clear_step_files", text="", icon='TRASH')
         layout.label(text="STEP IGES STL OBJ PLY glTF FBX 3MF", icon='FILE')
-
         layout.operator("mv.import_all_steps", icon='IMPORT')
         layout.operator("mv.add_product_collection", icon='OUTLINER_COLLECTION')
 
+        # Read-only lookup: draw() must not create the root.
+        root = bpy.data.collections.get(PRODUCT_COLL)
         prods = get_products()
-        header = layout.row(align=True)
-        header.prop(s, "show_products_list", text="",
-                    icon='TRIA_DOWN' if s.show_products_list else 'TRIA_RIGHT', emboss=False)
-        header.label(text=f"Products under '{PRODUCT_COLL}' ({len(prods)})")
-        if s.show_products_list:
+        if not prods:
+            layout.label(text=f"Nothing under {PRODUCT_COLL} yet.", icon='INFO')
+            return
+
+        layout.separator()
+        layout.label(text="Render these:")
+        row = layout.row()
+        row.template_list("MV_UL_Products", "", root, "children",
+                          s, "active_product_index", rows=4)
+        col = row.column(align=True)
+        col.operator("mv.set_products_render", text="", icon='CHECKBOX_HLT').state = True
+        col.operator("mv.set_products_render", text="", icon='CHECKBOX_DEHLT').state = False
+
+        coll, _ = active_product(context)
+        if coll is not None:
+            col = layout.column(align=True)
+            col.label(text=f"{coll.name}, as imported:", icon='OUTLINER_COLLECTION')
+            col.label(text=format_real_size(coll) or "size not recorded yet")
+            if s.part == 'VARIANTS':
+                # Keep Own here is what leaves a product out of the draw, so it
+                # belongs beside the list rather than in a materials panel.
+                row = col.row(align=True)
+                row.prop(coll, "mv_material", text="")
+                sub = row.row(align=True)
+                sub.active = coll.mv_material not in {'DEFAULT', 'KEEP'}
+                sub.prop(coll, "mv_material_color", text="")
+                if coll.mv_material == 'KEEP':
+                    col.label(text="Keep Own: rendered once, no variants.", icon='INFO')
+
+        strays = stray_render_objects(context)
+        if strays:
             box = layout.box()
-            if not prods:
-                box.label(text="(none)", icon='INFO')
-            else:
-                for pc in prods:
-                    box.label(text=f"{pc.name}  ({len(pc.all_objects)} objs)", icon='OUTLINER_COLLECTION')
+            box.label(text=f"{len(strays)} object(s) outside {PRODUCT_COLL}", icon='ERROR')
+            box.label(text="appear in every render:")
+            col = box.column(align=True)
+            for obj in strays[:4]:
+                col.label(text=obj.name, icon='OBJECT_DATA')
+            if len(strays) > 4:
+                col.label(text=f"+{len(strays) - 4} more")
+            box.label(text="Delete them, move them into a")
+            box.label(text="product, or switch off their")
+            box.label(text="render visibility (camera icon).")
 
 
-class MV_PT_Standardize(Panel):
+class MV_PT_Standardize(_ProductPanel, Panel):
     bl_label = "Standardize"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "MultiView"
 
     def draw(self, context):
         layout = self.layout
@@ -8123,88 +8559,76 @@ class MV_PT_Standardize(Panel):
         layout.separator()
         layout.operator("mv.standardize", icon='FULLSCREEN_EXIT')
 
-        coll, _ = active_product(context)
-        if coll is not None:
-            real = format_real_size(coll)
-            col = layout.column(align=True)
-            col.label(text=f"{coll.name}, as imported:", icon='OUTLINER_COLLECTION')
-            col.label(text=real or "size not recorded yet")
 
-
-class MV_PT_Cameras(Panel):
-    bl_label = "Cameras / Views"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "MultiView"
+class MV_PT_Views(_ProductPanel, Panel):
+    bl_label = "Views"
 
     def draw(self, context):
         layout = self.layout
         s = context.scene.mv_settings
-        layout.prop(s, "view_protocol")
         spec = VIEW_PROTOCOLS.get(s.view_protocol)
         if spec:
+            # The protocol lives under Dataset & research, so say here why the
+            # view set has stopped answering.
             box = layout.box()
-            col = box.column(align=True)
-            col.label(text=f"{len(protocol_views(s))} perspective views"
-                      + (f", {spec['fov']:g} deg FOV" if "fov" in spec else ""), icon='INFO')
-            if any(r for _, _, r in protocol_views(s)):
-                col.label(text="Distances in object sizes x Target Size.")
-                col.label(text="Published numbers: Fit Each, Target 1.0.")
-            if spec.get("random"):
-                box.prop(s, "protocol_seed")
+            box.label(text=f"Protocol: {spec['label']}", icon='LOCKED')
+            box.label(text="It picks the views. Change or clear")
+            box.label(text="it under Dataset & research.")
 
-        # A preset is drawn from VIEW_SETS, not from the checkboxes, because
-        # that is what build_cameras reads for it. Only Custom edits them.
         views_col = layout.column()
         views_col.active = spec is None
-        layout = views_col
-        layout.prop(s, "view_set")
+        views_col.prop(s, "view_set")
         custom = s.view_set == 'CUSTOM'
         preset = set() if custom else {v[0] for v in VIEW_SETS[s.view_set]}
-        ortho = layout.grid_flow(row_major=True, columns=3, even_columns=True, align=True)
-        persp = layout.row(align=True)
+        ortho = views_col.grid_flow(row_major=True, columns=3, even_columns=True, align=True)
+        persp = views_col.row(align=True)
         persp.label(text="Persp:")
         for i, (name, kind, _) in enumerate(VIEWS_ALL):
             # Perspective names are too long for a third of the sidebar, so
             # they get their own row and drop the shared prefix.
             cell = (ortho if kind == "ortho" else persp).row()
             text = name.replace("Persp_", "")
-            if custom:
+            if custom and spec is None:
                 cell.prop(s, "views_enabled", index=i, text=text)
             else:
                 cell.enabled = False
                 cell.label(text=text,
                            icon='CHECKBOX_HLT' if name in preset else 'CHECKBOX_DEHLT')
 
-        layout = self.layout
         layout.prop(s, "front_axis")
         layout.prop(s, "frame_padding_factor")
 
         col = layout.column()
         col.active = spec is None
-        col.label(text="Custom Views (direction from target):")
+        col.label(text="Custom views (direction from target):")
         row = col.row()
-        row.template_list("MV_UL_CustomViews", "", s, "custom_views", s, "custom_views_index", rows=2)
+        row.template_list("MV_UL_CustomViews", "", s, "custom_views",
+                          s, "custom_views_index", rows=2)
         row.column(align=True).operator("mv.add_custom_view", text="", icon='ADD')
 
         layout.operator("mv.build_cameras", icon='CAMERA_DATA')
 
-        layout.separator()
-        box = layout.box()
-        box.label(text="Orient Products:")
+
+class MV_PT_ViewsOrient(_ProductPanel, Panel):
+    bl_label = "Orient Products"
+    bl_parent_id = "MV_PT_Views"
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.mv_settings
 
         products = get_products()
         if not products:
-            box.label(text="No products to orient.", icon='INFO')
+            layout.label(text="No products to orient.", icon='INFO')
             return
 
         coll, idx = active_product(context)
-        box.label(text=f"{coll.name}  ({idx + 1}/{len(products)})",
-                  icon='OUTLINER_COLLECTION')
-        box.prop(s, "isolate_active")
-        box.prop(s, "rotate_step")
+        layout.label(text=f"{coll.name}  ({idx + 1}/{len(products)})",
+                     icon='OUTLINER_COLLECTION')
+        layout.prop(s, "isolate_active")
+        layout.prop(s, "rotate_step")
 
-        col = box.column(align=True)
+        col = layout.column(align=True)
         row = col.row(align=True)
         row.operator("mv.rotate_product", text="Left", icon='TRIA_LEFT').direction = 'LEFT'
         row.operator("mv.rotate_product", text="Right", icon='TRIA_RIGHT').direction = 'RIGHT'
@@ -8212,103 +8636,321 @@ class MV_PT_Cameras(Panel):
         row.operator("mv.rotate_product", text="Up", icon='TRIA_UP').direction = 'UP'
         row.operator("mv.rotate_product", text="Down", icon='TRIA_DOWN').direction = 'DOWN'
 
-        col = box.column(align=True)
+        col = layout.column(align=True)
         col.prop(s, "orient_method", text="")
         row = col.row(align=True)
-        row.operator("mv.auto_orient", text="Auto Orient", icon='ORIENTATION_GLOBAL').all_products = False
+        row.operator("mv.auto_orient", text="Auto Orient",
+                     icon='ORIENTATION_GLOBAL').all_products = False
         row.operator("mv.auto_orient", text="All").all_products = True
         row = col.row(align=True)
         row.operator("mv.reset_orientation", text="Reset", icon='LOOP_BACK').all_products = False
         row.operator("mv.reset_orientation", text="All").all_products = True
 
-        row = box.row(align=True)
+        row = layout.row(align=True)
         row.operator("mv.product_step", text="Previous", icon='FRAME_PREV').delta = -1
         row.operator("mv.product_step", text="Next", icon='FRAME_NEXT').delta = 1
-        box.operator("mv.show_all_products", icon='HIDE_OFF')
+        layout.operator("mv.show_all_products", icon='HIDE_OFF')
         if s.reframe_on_render:
-            box.label(text="Render reframes the cameras itself.", icon='INFO')
+            layout.label(text="Render reframes the cameras itself.", icon='INFO')
         else:
-            box.label(text="Rebuild cameras after rotating to reframe.", icon='INFO')
+            layout.label(text="Rebuild cameras after rotating.", icon='INFO')
 
 
-class MV_PT_Render(Panel):
-    bl_label = "Batch Render"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "MultiView"
+class MV_PT_Stage(_ProductPanel, Panel):
+    bl_label = "Stage"
 
     def draw(self, context):
         layout = self.layout
         s = context.scene.mv_settings
-        layout.prop(s, "render_output_dir")
-        layout.prop(s, "render_mode")
-        if s.render_mode in {'CLAY', 'BOTH'} or (s.pass_lines and s.lines_fill == 'CLAY'):
-            layout.prop(s, "clay_color")
-        layout.label(text="Extra passes:")
+        lit = needs_lighting(s)
+
+        if lit:
+            col = layout.column(align=True)
+            col.label(text="Lighting:")
+            row = col.row(align=True)
+            row.prop(s, "lighting_preset", text="")
+            row.operator("mv.save_lighting_preset", text="", icon='ADD')
+            row.operator("mv.delete_lighting_preset", text="", icon='REMOVE')
+            col.prop(s, "lighting_intensity", slider=True)
+            layout.prop(s, "lights_follow_camera")
+
+        col = layout.column(align=True)
+        col.label(text="Background:")
+        col.row(align=True).prop(s, "world_mode", expand=True)
+        if s.world_mode == 'HDRI':
+            col.prop(s, "hdri_path", text="")
+            row = col.row(align=True)
+            row.prop(s, "hdri_strength")
+            row.prop(s, "hdri_rotation")
+            col.prop(s, "hdri_visible")
+        col.prop(s, "transparent_bg")
+        row = col.row()
+        # The colour still shows behind an HDRI the camera is not shown.
+        row.enabled = not s.transparent_bg and not (s.world_mode == 'HDRI' and s.hdri_visible)
+        row.prop(s, "bg_color", text="")
+
+        if lit:
+            col = layout.column(align=True)
+            col.label(text="Ground:")
+            col.prop(s, "ground_mode", text="")
+            if s.ground_mode == 'FLOOR':
+                row = col.row(align=True)
+                row.prop(s, "ground_color", text="")
+                row.prop(s, "ground_roughness")
+            elif s.ground_mode == 'SHADOW' and context.scene.render.engine != 'CYCLES':
+                col.label(text="Shadow Catcher needs Cycles.", icon='ERROR')
+        else:
+            layout.label(text="Clay brings its own studio light", icon='INFO')
+            layout.label(text="and leaves the ground out, so")
+            layout.label(text="neither needs setting up here.")
+
+        layout.separator()
+        layout.operator("mv.apply_scene_setup", icon='SCENE_DATA')
         row = layout.row(align=True)
-        row.prop(s, "pass_lines", toggle=True)
-        row.prop(s, "pass_mask", toggle=True)
-        row.prop(s, "pass_ao", toggle=True)
+        if lit:
+            row.operator("mv.build_lighting", text="Lighting Only", icon='LIGHT')
+        row.operator("mv.apply_world", text="Background Only", icon='WORLD')
+
+
+class MV_PT_StageMaterial(_ProductPanel, Panel):
+    bl_label = "Base Material"
+    bl_parent_id = "MV_PT_Stage"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        s = context.scene.mv_settings
+        return s.part in PRODUCT_PARTS and needs_lighting(s)
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.mv_settings
+        row = layout.row(align=True)
+        row.prop(s, "material_preset", text="")
+        sub = row.row(align=True)
+        sub.active = s.material_preset != 'KEEP'
+        sub.prop(s, "material_color", text="")
+        layout.label(text="Full renders only. A product can", icon='INFO')
+        layout.label(text="pick its own beside the Products list.")
+        if s.part == 'VARIANTS' and s.pool_variants:
+            layout.label(text="Pool variants override this.", icon='INFO')
+
+
+class MV_PT_Pool(_Sidebar, Panel):
+    bl_label = "Texture Pool"
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.mv_settings.part in POOL_PARTS
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.mv_settings
+        row = layout.row(align=True)
+        row.prop(s, "pool_folder", text="")
+        row.operator("mv.scan_pool", text="", icon='FILE_REFRESH')
+        if s.material_pool:
+            row = layout.row()
+            row.template_list("MV_UL_Pool", "", s, "material_pool",
+                              s, "material_pool_index", rows=5)
+            col = row.column(align=True)
+            col.operator("mv.set_pool", text="", icon='CHECKBOX_HLT').state = True
+            col.operator("mv.set_pool", text="", icon='CHECKBOX_DEHLT').state = False
+            ticked = sum(1 for m in s.material_pool if m.enabled)
+            layout.label(text=f"{ticked} of {len(s.material_pool)} ticked")
+            layout.label(text="C colour  R rough  M metal  A packed", icon='INFO')
+            layout.label(text="H height  N normal  O opacity")
+        else:
+            layout.label(text="Pick a folder and scan it. Every", icon='INFO')
+            layout.label(text="material needs a colour map.")
+        # A patch shows one repeat filling the frame whatever the real part
+        # would be, so the tile size says nothing about it.
+        if s.part == 'VARIANTS':
+            layout.prop(s, "pool_tile_mm")
+
+
+class MV_PT_Patch(_Sidebar, Panel):
+    bl_label = "Patch"
+
+    @classmethod
+    def poll(cls, context):
+        # Patches only. The Variants part is about textures on products, and a
+        # patch control there was the one place the sidebar still mixed two
+        # parts together. A job file can still set pool_patches for a run that
+        # wants both.
+        return context.scene.mv_settings.part == 'PATCHES'
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.mv_settings
+
+        layout.label(text="Shapes, across:")
+        grid = layout.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
+        for i, (_, label, _) in enumerate(PATCH_SHAPES):
+            grid.prop(s, "patch_shapes", index=i, text=label)
+
+        row = layout.row(align=True)
+        row.label(text="Lighting, down:")
+        row.operator("mv.sync_patch_lighting", text="", icon='FILE_REFRESH')
+        if s.patch_lighting:
+            row = layout.row()
+            row.template_list("MV_UL_PatchLighting", "", s, "patch_lighting",
+                              s, "patch_lighting_index", rows=4)
+            col = row.column(align=True)
+            col.operator("mv.set_patch_lighting", text="", icon='CHECKBOX_HLT').state = True
+            col.operator("mv.set_patch_lighting", text="", icon='CHECKBOX_DEHLT').state = False
+        else:
+            layout.label(text="Refresh to list the lighting presets.", icon='INFO')
+
+        layout.prop(s, "patch_size")
+        layout.prop(s, "patch_labels")
+
+        shapes = patch_shape_keys(s)
+        # Counted rather than resolved: patch_lightings() reads every saved
+        # preset off disk, and draw() runs on every redraw.
+        lights = max(1, sum(1 for item in s.patch_lighting if item.enabled))
+        tiles = len(shapes) * lights
+        materials = len(pool_entries(s))
+        layout.label(text=f"{len(shapes)} shapes x {lights} lighting = {tiles} tiles")
+        layout.label(text=f"{materials} material(s), one grid each "
+                          f"({materials * tiles} renders)")
+        if not any(s.patch_shapes):
+            layout.label(text="No shape ticked, so the flat swatch", icon='ERROR')
+            layout.label(text="is used on its own.")
+        if not any(item.enabled for item in s.patch_lighting):
+            layout.label(text="No lighting ticked, so the built-in", icon='INFO')
+            layout.label(text="studio rig is used.")
+        layout.label(text="Saved lighting presets are listed here", icon='INFO')
+        layout.label(text="too: build a rig in a product scene,")
+        layout.label(text="save it under Stage, then refresh.")
+        if context.scene.render.engine == 'BLENDER_WORKBENCH':
+            layout.label(text="Workbench cannot show textures, so", icon='INFO')
+            layout.label(text="patches render in Cycles instead.")
+
+
+class MV_PT_Variants(_Sidebar, Panel):
+    bl_label = "Variants"
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.mv_settings.part == 'VARIANTS'
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.mv_settings
+        row = layout.row(align=True)
+        row.prop(s, "pool_variants", text="Count")
+        row.prop(s, "pool_seed", text="Seed")
+        layout.prop(s, "pool_per_part")
+
+        entries = len(pool_entries(s))
+        if not entries:
+            layout.label(text="The pool is empty: scan a folder.", icon='ERROR')
+            return
+        products = [pc for pc in get_products() if pc.mv_render]
+        taking = [pc for pc in products if takes_variants(pc)]
+        layout.label(text=f"{len(taking)} product(s) x {s.pool_variants} draws")
+        layout.label(text=f"from {entries} ticked material(s)")
+        keeping = len(products) - len(taking)
+        if keeping:
+            layout.label(text=f"{keeping} set to Keep Own: rendered", icon='INFO')
+            layout.label(text="once, in their own materials.")
+        layout.label(text="The same seed always gives the same", icon='INFO')
+        layout.label(text="draws, whatever else is in the batch.")
+
+
+class MV_PT_Render(_Sidebar, Panel):
+    bl_label = "Output"
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.mv_settings
+        part = s.part
+        layout.prop(s, "render_output_dir")
+
+        if part == 'CLAY':
+            # Clay is the point of this part, but a form view in the product's
+            # own CAD colours is the same dataset, so the choice stays here.
+            layout.prop(s, "render_mode", text="Shading")
+        if (s.render_mode in {'CLAY', 'BOTH'} and part == 'CLAY') or \
+                (part in PRODUCT_PARTS and s.pass_lines and s.lines_fill == 'CLAY'):
+            layout.prop(s, "clay_color")
+
+        if part in PRODUCT_PARTS:
+            layout.label(text="Extra passes:")
+            row = layout.row(align=True)
+            row.prop(s, "pass_lines", toggle=True)
+            row.prop(s, "pass_mask", toggle=True)
+            row.prop(s, "pass_ao", toggle=True)
+
         col = layout.column(align=True)
         col.prop(s, "skip_existing")
-        col.prop(s, "reframe_on_render")
+        if part in PRODUCT_PARTS:
+            col.prop(s, "reframe_on_render")
 
-        # Read-only lookup: draw() must not create the root.
-        root = bpy.data.collections.get(PRODUCT_COLL)
-        prods = get_products()
-        if prods:
-            layout.label(text="Products to render:")
-            row = layout.row()
-            row.template_list("MV_UL_Products", "", root, "children",
-                              s, "active_product_index", rows=4)
-            col = row.column(align=True)
-            col.operator("mv.set_products_render", text="", icon='CHECKBOX_HLT').state = True
-            col.operator("mv.set_products_render", text="", icon='CHECKBOX_DEHLT').state = False
-
-        strays = stray_render_objects(context)
-        if strays:
-            box = layout.box()
-            box.label(text=f"{len(strays)} object(s) outside {PRODUCT_COLL}", icon='ERROR')
-            box.label(text="appear in every render:")
-            col = box.column(align=True)
-            for obj in strays[:4]:
-                col.label(text=obj.name, icon='OBJECT_DATA')
-            if len(strays) > 4:
-                col.label(text=f"+{len(strays) - 4} more")
-            box.label(text="Delete them, move them into a")
-            box.label(text="product, or switch off their")
-            box.label(text="render visibility (camera icon).")
-
-        ticked = sum(1 for pc in prods if pc.mv_render)
+        layout.separator()
         row = layout.row(align=True)
-        row.scale_y = 1.3
-        row.operator("mv.render_all", icon='RENDER_STILL',
-                     text="Render All" if ticked == len(prods) else f"Render {ticked} Ticked",
-                     ).only_active = False
-        row.operator("mv.render_all", text="Render Active",
-                     icon='RESTRICT_RENDER_OFF').only_active = True
+        row.scale_y = 1.4
+        if part == 'PATCHES':
+            row.operator("mv.render_all", icon='MATSPHERE',
+                         text=f"Render {PART_LABELS[part]}").only_active = False
+        else:
+            prods = get_products()
+            ticked = sum(1 for pc in prods if pc.mv_render)
+            row.operator("mv.render_all", icon='RENDER_STILL',
+                         text=(f"Render {PART_LABELS[part]}" if ticked == len(prods)
+                               else f"Render {ticked} Ticked")).only_active = False
+            row.operator("mv.render_all", text="Active",
+                         icon='RESTRICT_RENDER_OFF').only_active = True
 
+        for line in self._estimate(context, s, part):
+            layout.label(text=line)
+        layout.label(text="Esc stops after the image in progress.", icon='INFO')
+        layout.label(text="Engine, samples, resolution and format", icon='INFO')
+        layout.label(text="stay in Blender's own properties.")
+
+    @staticmethod
+    def _estimate(context, s, part):
+        """How many files the button is about to write, as lines of text."""
+        if part == 'PATCHES':
+            n = len(pool_entries(s))
+            return [f"{n} ticked material(s) = {n} patch(es)"]
+
+        prods = get_products()
+        ticked = sum(1 for pc in prods if pc.mv_render)
         if s.reframe_on_render:
-            # What Render All is about to build, not what is in MV_Cameras now.
-            n_cams = sum(1 for v in planned_views(s) if Vector(v[2]).length >= 1e-9)
+            # What Render is about to build, not what is in MV_Cameras now.
+            views = sum(1 for v in planned_views(s) if Vector(v[2]).length >= 1e-9)
         else:
             cam_coll = bpy.data.collections.get(CAMERA_COLL)
-            n_cams = len([o for o in cam_coll.objects if o.type == 'CAMERA']) if cam_coll else 0
-        mult = ((2 if s.render_mode == 'BOTH' else 1) + s.pass_lines + s.pass_mask + s.pass_ao
-                + len(data_modes(s)))
-        layout.label(text=f"{ticked} products x {n_cams} views x {mult} = {ticked * n_cams * mult} images")
+            views = len([o for o in cam_coll.objects if o.type == 'CAMERA']) if cam_coll else 0
+        full = 2 if s.render_mode == 'BOTH' else 1
+        rest = s.pass_lines + s.pass_mask + s.pass_ao + len(data_modes(s))
+
+        lines = []
+        if part == 'VARIANTS' and s.pool_variants and pool_entries(s):
+            # Only the Full render repeats per variant; the other passes do not
+            # depend on the material and are rendered once per view.
+            each = full * s.pool_variants + rest
+            lines.append(f"{ticked} x {views} views x {each} = {ticked * views * each} images")
+            lines.append(f"({s.pool_variants} variants; the rest rendered once)")
+        else:
+            each = full + rest
+            lines.append(f"{ticked} x {views} views x {each} = {ticked * views * each} images")
         if s.turntable_enabled:
-            layout.label(text=f"+ {ticked} turntable(s) x {s.turntable_frames} frames")
-        layout.label(text="Esc stops after the image in progress.", icon='INFO')
-        layout.label(text="Engine/samples/resolution/format: Blender Output props", icon='INFO')
+            lines.append(f"+ {ticked} turntable(s) x {s.turntable_frames} frames")
+        return lines
 
 
-class _RenderSubPanel:
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "MultiView"
+class _RenderSubPanel(_Sidebar):
     bl_parent_id = "MV_PT_Render"
     bl_options = {'DEFAULT_CLOSED'}
+
+
+class _RenderProductSubPanel(_RenderSubPanel):
+    @classmethod
+    def poll(cls, context):
+        return context.scene.mv_settings.part in PRODUCT_PARTS
 
 
 class MV_PT_RenderPreflight(_RenderSubPanel, Panel):
@@ -8349,6 +8991,13 @@ class MV_PT_RenderNaming(_RenderSubPanel, Panel):
     def draw(self, context):
         layout = self.layout
         s = context.scene.mv_settings
+        if s.part == 'PATCHES':
+            layout.label(text="A patch is named after its material,", icon='INFO')
+            layout.label(text="in materials/ inside the output")
+            layout.label(text="folder. The templates below belong")
+            layout.label(text="to the other two parts.")
+            return
+
         row = layout.row(align=True)
         row.prop(s, "start_prefix")
         row.prop(s, "start_number")
@@ -8363,8 +9012,9 @@ class MV_PT_RenderNaming(_RenderSubPanel, Panel):
         prods = get_products()
         views = planned_views(s)
         mode = {'FULL': "", 'CLAY': "clay", 'BOTH': "render"}[s.render_mode]
+        variant = "v01" if (s.part == 'VARIANTS' and s.pool_variants) else ""
         values = name_values(s, 0, prods[0].name if prods else "Product",
-                             views[0][0] if views else "Front", mode)
+                             views[0][0] if views else "Front", mode, variant)
         folder = output_folder(s, values).replace(os.sep, "/")
         col = layout.column(align=True)
         col.label(text=f"{folder}/" if folder else "(output directory)", icon='FILE_FOLDER')
@@ -8372,7 +9022,34 @@ class MV_PT_RenderNaming(_RenderSubPanel, Panel):
                   icon='FILE_IMAGE')
 
 
-class MV_PT_RenderSheet(_RenderSubPanel, Panel):
+class MV_PT_RenderPasses(_RenderProductSubPanel, Panel):
+    bl_label = "Pass Settings"
+
+    @classmethod
+    def poll(cls, context):
+        s = context.scene.mv_settings
+        return s.part in PRODUCT_PARTS and (s.pass_lines or s.pass_ao)
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.mv_settings
+        if s.pass_lines:
+            layout.label(text="Line art:")
+            layout.prop(s, "lines_angle")
+            row = layout.row(align=True)
+            row.prop(s, "lines_width")
+            row.prop(s, "lines_color", text="")
+            layout.prop(s, "lines_fill")
+        if s.pass_ao:
+            layout.label(text="Ambient occlusion:")
+            row = layout.row(align=True)
+            row.prop(s, "ao_samples", text="Samples")
+            row.prop(s, "ao_distance", text="Distance")
+            if not hasattr(context.scene, "cycles"):
+                layout.label(text="Needs the Cycles add-on.", icon='ERROR')
+
+
+class MV_PT_RenderSheet(_RenderProductSubPanel, Panel):
     bl_label = "Contact Sheet"
 
     def draw_header(self, context):
@@ -8394,9 +9071,11 @@ class MV_PT_RenderSheet(_RenderSubPanel, Panel):
             layout.label(text="Labels need a newer Blender.", icon='ERROR')
         if s.post_enabled:
             layout.label(text="Built from the processed copies.", icon='INFO')
+        if s.part == 'VARIANTS' and s.pool_variants:
+            layout.label(text="One sheet per variant.", icon='INFO')
 
 
-class MV_PT_RenderTurntable(_RenderSubPanel, Panel):
+class MV_PT_RenderTurntable(_RenderProductSubPanel, Panel):
     bl_label = "Turntable"
 
     def draw_header(self, context):
@@ -8450,36 +9129,56 @@ class MV_PT_RenderPost(_RenderSubPanel, Panel):
         layout.prop(s, "post_max_size")
         layout.label(text="Extra sizes, e.g. 1024, 256:")
         layout.prop(s, "post_extra_sizes", text="")
+        if s.part == 'PATCHES':
+            layout.label(text="Patches are not post-processed.", icon='INFO')
 
 
-class MV_PT_RenderPasses(_RenderSubPanel, Panel):
-    bl_label = "Extra Passes"
+class MV_PT_Dataset(_Sidebar, Panel):
+    bl_label = "Dataset & Research"
+    bl_options = {'DEFAULT_CLOSED'}
 
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="What a dataset needs and a picture", icon='INFO')
+        layout.label(text="does not: camera poses, depth, masks,")
+        layout.label(text="drawings, randomization, provenance.")
+
+
+class _DatasetSubPanel(_Sidebar):
+    bl_parent_id = "MV_PT_Dataset"
+    bl_options = {'DEFAULT_CLOSED'}
+
+
+class _DatasetProductSubPanel(_DatasetSubPanel):
     @classmethod
     def poll(cls, context):
-        s = context.scene.mv_settings
-        return s.pass_lines or s.pass_ao
+        return context.scene.mv_settings.part in PRODUCT_PARTS
+
+
+class MV_PT_DatasetProtocols(_DatasetProductSubPanel, Panel):
+    bl_label = "Camera Protocols"
 
     def draw(self, context):
         layout = self.layout
         s = context.scene.mv_settings
-        if s.pass_lines:
-            layout.label(text="Line Art:")
-            layout.prop(s, "lines_angle")
-            row = layout.row(align=True)
-            row.prop(s, "lines_width")
-            row.prop(s, "lines_color", text="")
-            layout.prop(s, "lines_fill")
-        if s.pass_ao:
-            layout.label(text="Ambient Occlusion:")
-            row = layout.row(align=True)
-            row.prop(s, "ao_samples", text="Samples")
-            row.prop(s, "ao_distance", text="Distance")
-            if not hasattr(context.scene, "cycles"):
-                layout.label(text="Needs the Cycles add-on.", icon='ERROR')
+        layout.prop(s, "view_protocol", text="")
+        spec = VIEW_PROTOCOLS.get(s.view_protocol)
+        if not spec:
+            layout.label(text="Views come from the Views panel.", icon='INFO')
+            return
+        views = protocol_views(s)
+        col = layout.column(align=True)
+        col.label(text=f"{len(views)} perspective views"
+                       + (f", {spec['fov']:g} deg FOV" if "fov" in spec else ""), icon='INFO')
+        col.label(text="This replaces the view set entirely.")
+        if any(r for _, _, r in views):
+            col.label(text="Distances in object sizes x Target Size.")
+            col.label(text="Published numbers: Fit Each, Target 1.0.")
+        if spec.get("random"):
+            layout.prop(s, "protocol_seed")
 
 
-class MV_PT_RenderAnnotations(_RenderSubPanel, Panel):
+class MV_PT_DatasetAnnotations(_DatasetProductSubPanel, Panel):
     bl_label = "Annotations"
 
     def draw(self, context):
@@ -8506,7 +9205,7 @@ class MV_PT_RenderAnnotations(_RenderSubPanel, Panel):
             layout.label(text="Needs the Cycles add-on.", icon='ERROR')
 
 
-class MV_PT_RenderDrawings(_RenderSubPanel, Panel):
+class MV_PT_DatasetDrawings(_DatasetProductSubPanel, Panel):
     bl_label = "Drawings"
 
     def draw_header(self, context):
@@ -8525,7 +9224,7 @@ class MV_PT_RenderDrawings(_RenderSubPanel, Panel):
         layout.label(text="SVG at 1:1 in source units.", icon='INFO')
 
 
-class MV_PT_RenderRandomize(_RenderSubPanel, Panel):
+class MV_PT_DatasetRandomize(_DatasetProductSubPanel, Panel):
     bl_label = "Randomize"
 
     def draw_header(self, context):
@@ -8554,9 +9253,12 @@ class MV_PT_RenderRandomize(_RenderSubPanel, Panel):
         layout.prop(s, "random_material")
         layout.prop(s, "random_distractors")
         layout.label(text="Masks and annotations stay exact.", icon='INFO')
+        if s.part == 'VARIANTS' and s.pool_variants and s.random_material:
+            layout.label(text="Variants choose the materials, so", icon='INFO')
+            layout.label(text="random materials are left out.")
 
 
-class MV_PT_RenderManifest(_RenderSubPanel, Panel):
+class MV_PT_DatasetManifest(_DatasetSubPanel, Panel):
     bl_label = "Manifest"
 
     def draw(self, context):
@@ -8580,6 +9282,7 @@ classes = (
     MV_StepFileItem,
     MV_Issue,
     MV_PoolMaterial,
+    MV_PatchLight,
     MV_CustomView,
     MV_Settings,
     MV_OT_AddStepFile,
@@ -8593,6 +9296,8 @@ classes = (
     MV_OT_ApplyWorld,
     MV_OT_ScanPool,
     MV_OT_SetPool,
+    MV_OT_SyncPatchLighting,
+    MV_OT_SetPatchLighting,
     MV_OT_RenderPatches,
     MV_OT_SaveLightingPreset,
     MV_OT_DeleteLightingPreset,
@@ -8614,25 +9319,33 @@ classes = (
     MV_UL_CustomViews,
     MV_UL_Products,
     MV_UL_Pool,
-    # Panels draw in the sidebar in the order they are registered.
+    MV_UL_PatchLighting,
+    # Panels draw in the sidebar in the order they are registered, and a
+    # sub-panel's parent has to be registered before it.
+    MV_PT_Mode,
     MV_PT_Guide,
-    MV_PT_SceneSetup,
-    MV_PT_SceneMaterials,
-    MV_PT_ScenePool,
-    MV_PT_Import,
+    MV_PT_Products,
     MV_PT_Standardize,
-    MV_PT_Cameras,
+    MV_PT_Views,
+    MV_PT_ViewsOrient,
+    MV_PT_Stage,
+    MV_PT_StageMaterial,
+    MV_PT_Pool,
+    MV_PT_Patch,
+    MV_PT_Variants,
     MV_PT_Render,
     MV_PT_RenderPreflight,
     MV_PT_RenderNaming,
+    MV_PT_RenderPasses,
     MV_PT_RenderSheet,
     MV_PT_RenderTurntable,
-    MV_PT_RenderPasses,
     MV_PT_RenderPost,
-    MV_PT_RenderAnnotations,
-    MV_PT_RenderDrawings,
-    MV_PT_RenderRandomize,
-    MV_PT_RenderManifest,
+    MV_PT_Dataset,
+    MV_PT_DatasetProtocols,
+    MV_PT_DatasetAnnotations,
+    MV_PT_DatasetDrawings,
+    MV_PT_DatasetRandomize,
+    MV_PT_DatasetManifest,
 )
 
 
